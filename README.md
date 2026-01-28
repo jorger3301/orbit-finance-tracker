@@ -1,4 +1,4 @@
-# 🚀 Orbit Tracker v10.9
+#  Orbit Finance Tracker  v10.9
 
 **Professional Telegram bot for tracking Orbit Finance DLMM pools on Solana**
 
