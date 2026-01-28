@@ -261,5 +261,5 @@ MIT License
 ---
 
 <p align="center">
-  <b>Built with ❤️ for the Orbit Finance community</b>
+  <b>Built with ❤️ for the Cipher community</b>
 </p>
