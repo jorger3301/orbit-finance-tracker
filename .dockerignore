@@ -1,0 +1,13 @@
+node_modules/
+data/
+*.db
+.env
+.env.*
+.git/
+.gitignore
+*.md
+!README.md
+*.log
+*.zip
+.DS_Store
+.fly/
