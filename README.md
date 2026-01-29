@@ -172,4 +172,4 @@ MIT License - feel free to use and modify.
 
 ---
 
-Made with ❤️ for the Orbit Finance community
+Made with ❤️ for the Cipher community
