@@ -1,16 +1,15 @@
-# ═══════════════════════════════════════════════════════════════════════════════
-# ORBIT TRACKER v10.9 - Fly.io Configuration
-# ═══════════════════════════════════════════════════════════════════════════════
+# Orbit Tracker v11.0 - Fly.io Configuration
+# https://fly.io/docs/reference/configuration/
 
 app = "orbit-tracker"
-primary_region = "sjc"  # San Jose, California (low latency to Solana)
+primary_region = "sjc"
 
 [build]
   dockerfile = "Dockerfile"
 
 [env]
   NODE_ENV = "production"
-  DATA_DIR = "/data"  # Persistent volume mount point
+  DATA_DIR = "/data"
   DEBUG = "false"
 
 [mounts]
@@ -20,9 +19,9 @@ primary_region = "sjc"  # San Jose, California (low latency to Solana)
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = false   # IMPORTANT: Keep bot always running
+  auto_stop_machines = false
   auto_start_machines = true
-  min_machines_running = 1     # Always keep 1 instance running
+  min_machines_running = 1
 
 [[vm]]
   memory = "512mb"

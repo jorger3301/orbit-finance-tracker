@@ -1,261 +1,175 @@
-#  Orbit Finance Tracker  v10.9
+# 🚀 Orbit Tracker v11.0
 
-**Professional Telegram bot for tracking Orbit Finance DLMM pools on Solana**
+Professional Telegram bot for tracking Orbit Finance DLMM pools on Solana.
 
-[![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
-[![Telegram](https://img.shields.io/badge/Telegram-Bot-blue.svg)](https://core.telegram.org/bots)
-[![Solana](https://img.shields.io/badge/Solana-Mainnet-purple.svg)](https://solana.com/)
-[![Deploy](https://img.shields.io/badge/Deploy-Fly.io-8B5CF6.svg)](https://fly.io)
-
----
+![Version](https://img.shields.io/badge/version-11.0.0-blue)
+![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-green)
+![License](https://img.shields.io/badge/license-MIT-brightgreen)
 
 ## ✨ Features
 
-### 📊 Real-Time Trading Alerts
-- 🔷 **CIPHER token** buy/sell alerts with customizable thresholds
-- 🌐 **All Orbit DLMM pools** monitoring
-- 🐋 **Whale tracking** — follow specific wallets
-- 📏 **Size indicators** (Tiny → Whale 🐋)
-- ✅ **Anchor discriminator detection** for accurate TX classification
+### 🌐 Pool Explorer
+- **Browse All Pools** - View all Orbit pools with sorting
+- **Sort by Volume/TVL/Trades** - Find the most active pools
+- **Trending Pools** - Top 10 by 24h volume
+- **New Pools** - Recently added pools (last 48h)
+- **Pool Search** - Find by name, symbol, or address
+- **Pool Details** - Price, volume, TVL, fees, links
 
-### 💧 Liquidity Monitoring
-- 📢 **LP add/remove alerts** with USD values
-- 📜 **Liquidity history** tracking per pool
-- ⚡ **Real-time WebSocket** updates
+### 🔔 Real-time Alerts
+- **CIPHER Alerts** - Buy/sell trades and LP events
+- **Other Pool Alerts** - Configurable for all pools
+- **Whale Tracking** - Monitor specific wallets
+- **LP Monitoring** - Add/remove liquidity events
+- **Custom Thresholds** - Set minimum alert amounts
 
-### 📈 Analytics & Charts
-- 🏆 **PnL Leaderboards** — Top traders by profit
-- 📊 **OHLCV Price Charts** — 15m, 1h, 4h, 1d timeframes
-- 📉 **Volume tracking** — 24h stats per pool
+### 📈 Portfolio Tracking
+- **Multi-Wallet Support** - Track up to 5 wallets
+- **Net Worth** - Total value across all holdings
+- **PnL Analytics** - Realized & unrealized profit/loss
+- **Token Holdings** - All tokens with USD values
+- **LP Positions** - Active liquidity positions
+- **Staked CIPHER** - sCIPHER balance and value
 
-### 👛 Portfolio Management
-- 💼 **Multi-wallet support** (up to 5 wallets)
-- 💎 **Net worth tracking** across all holdings
-- 💧 **LP position detection**
-- 📊 **PnL calculations**
+### 📊 Charts & Analytics
+- **OHLCV Charts** - 1h, 4h, 1d, 1w timeframes
+- **PnL Leaderboards** - Top traders by profit
+- **Liquidity History** - LP event timeline
+- **Volume Statistics** - 24h trading data
 
-### ⚙️ User Customization
-- 🔔 **Toggle alerts** — CIPHER, other pools, LP events
-- 💰 **Threshold settings** — minimum USD for alerts
-- 🔕 **Snooze/pause** — take breaks from alerts
-- 🌙 **Quiet hours** — schedule alert-free times
+### ⚙️ User Experience
+- **One-tap Setup** - Quick preset configurations
+- **Snooze/Quiet Hours** - Pause alerts temporarily
+- **Daily Digest** - Summary at 9:00 UTC
+- **Watchlists** - Track favorite tokens/pools
+- **Alert History** - Recent notifications
 
----
-
-## 📱 Bot Commands
+## 📱 Commands
 
 | Command | Description |
 |---------|-------------|
-| `/start` | Welcome & onboarding |
-| `/menu` | Main menu with buttons |
+| `/start` | Open main menu |
+| `/menu` | Open main menu |
+| `/pools` | Browse all pools |
+| `/trending` | Top pools by volume |
+| `/newpools` | Recently added pools |
+| `/portfolio` | View your portfolio |
+| `/pnl` | Quick PnL summary |
+| `/lp` | View LP positions |
+| `/refresh` | Sync portfolio data |
 | `/price` | SOL & CIPHER prices |
 | `/cipher` | CIPHER token stats |
-| `/chart` | Price chart (e.g. `/chart CIPHER 1h`) |
-| `/leaderboard` | Top traders by PnL |
+| `/chart` | Price chart |
+| `/leaderboard` | Top traders PnL |
 | `/liquidity` | LP event history |
-| `/portfolio` | Your portfolio overview |
-| `/pnl` | Quick PnL summary |
-| `/lp` | Your LP positions |
-| `/refresh` | Sync portfolio data |
 | `/wallets` | Manage tracked wallets |
 | `/settings` | Alert preferences |
 | `/pause` | Pause all alerts |
 | `/resume` | Resume alerts |
 | `/snooze` | Snooze for 1 hour |
-| `/stats` | Your usage statistics |
-| `/status` | Bot & API health |
-| `/help` | All commands |
+| `/stats` | Your usage stats |
+| `/status` | Bot & API status |
+| `/help` | Show all commands |
 
----
-
-## 🚀 Deploy on Fly.io
+## 🚀 Deployment (Fly.io)
 
 ### Prerequisites
+- [Fly.io account](https://fly.io)
+- Telegram Bot Token (from [@BotFather](https://t.me/BotFather))
+- Helius API Key (from [helius.dev](https://helius.dev))
 
-1. **Telegram Bot Token** from [@BotFather](https://t.me/BotFather)
-2. **Helius API Key** from [helius.dev](https://helius.dev)
-3. **Fly.io Account** at [fly.io](https://fly.io)
-
-### Step 1: Install Fly CLI
+### Quick Deploy
 
 ```bash
-# macOS
-brew install flyctl
-
-# Windows
-powershell -Command "iwr https://fly.io/install.ps1 -useb | iex"
-
-# Linux
+# Install Fly CLI
 curl -L https://fly.io/install.sh | sh
-```
 
-### Step 2: Login to Fly.io
-
-```bash
+# Login
 fly auth login
-```
 
-### Step 3: Clone/Create Your Repo
+# Clone repo
+git clone https://github.com/jorger3301/orbit-finance-tracker.git
+cd orbit-finance-tracker
 
-```bash
-# Create new directory
-mkdir orbit-tracker && cd orbit-tracker
-
-# Copy all files from zip into this directory
-# Then initialize git
-git init
-git add -A
-git commit -m "Initial commit"
-```
-
-### Step 4: Launch on Fly.io
-
-```bash
-# Launch the app (creates fly.toml if needed)
+# Create app
 fly launch --no-deploy
 
-# When prompted:
-# - App name: orbit-tracker (or your preferred name)
-# - Region: sjc (San Jose) or closest to you
-# - Don't setup Postgres
-# - Don't setup Redis
-```
-
-### Step 5: Create Persistent Volume
-
-```bash
-# Create 1GB volume for SQLite database
+# Create persistent volume
 fly volumes create orbit_data --region sjc --size 1
-```
 
-### Step 6: Set Secrets
+# Set secrets
+fly secrets set TELEGRAM_BOT_TOKEN=your_token HELIUS_API_KEY=your_key
 
-```bash
-# Set your API keys (replace with your actual values)
-fly secrets set TELEGRAM_BOT_TOKEN=your_bot_token_here
-fly secrets set HELIUS_API_KEY=your_helius_key_here
-```
-
-### Step 7: Deploy
-
-```bash
+# Deploy
 fly deploy
 ```
 
-### Step 8: Monitor Logs
+### Environment Variables
 
-```bash
-# Watch logs in real-time
-fly logs
-
-# You should see:
-# ✅ Helius SDK initialized
-# ✅ Database initialized
-# ✅ Orbit WS connected
-# 🏥 Health server listening on port 8080
-# 🚀 ORBIT TRACKER v10.9 (Production)
-```
-
-### Step 9: Test Your Bot
-
-Message your bot on Telegram:
-```
-/start
-/price
-/status
-```
-
----
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `TELEGRAM_BOT_TOKEN` | ✅ | Bot token from BotFather |
+| `HELIUS_API_KEY` | ✅ | Helius RPC API key |
+| `DATA_DIR` | ❌ | Data directory (default: `/data`) |
+| `DEBUG` | ❌ | Enable debug logs (default: `false`) |
 
 ## 📁 Project Structure
 
 ```
 orbit-tracker/
-├── index.js          # Main bot (7,795 lines)
+├── index.js          # Main bot code (8,300+ lines)
 ├── package.json      # Dependencies
-├── Dockerfile        # Docker build config
-├── fly.toml          # Fly.io configuration
-├── .dockerignore     # Docker build ignores
+├── Dockerfile        # Container config
+├── fly.toml          # Fly.io config
 ├── .env.example      # Environment template
-├── .gitignore        # Git ignores
-└── /data/            # Persistent volume (created by Fly.io)
-    └── orbit-tracker.db
+├── .gitignore        # Git ignore rules
+├── .dockerignore     # Docker ignore rules
+└── README.md         # Documentation
 ```
 
----
+## 🛠️ Tech Stack
 
-## 🔧 Fly.io Management Commands
+- **Runtime:** Node.js 18+
+- **Framework:** Telegraf 4.x
+- **Database:** SQLite (better-sqlite3)
+- **Blockchain:** Solana Web3.js, Helius SDK
+- **Charts:** Chart.js + chartjs-node-canvas
+- **Deployment:** Fly.io with persistent volumes
 
-```bash
-# Check app status
-fly status
+## 📊 Stats
 
-# View logs
-fly logs
+- **~8,300 lines** of production code
+- **22 commands** registered
+- **81 action handlers**
+- **130+ try/catch** blocks
+- **180+ safe handler** calls
 
-# SSH into container
-fly ssh console
+## 🔄 Updates
 
-# Scale resources
-fly scale memory 512
+### v11.0.0 (Latest)
+- 🌐 Pool Explorer with sorting & search
+- 🔥 Trending pools feature
+- 🆕 New pools discovery
+- ⚙️ Other pools settings panel
+- 🔧 Multi-wallet save fix
+- 💰 Staked CIPHER price fix
+- 📱 Updated help & welcome
 
-# Restart app
-fly apps restart
+### v10.9.0
+- Initial Fly.io deployment
+- Portfolio multi-wallet support
+- Staked CIPHER tracking
 
-# Open dashboard
-fly dashboard
-```
+## 📄 License
 
----
-
-## 💰 Fly.io Pricing
-
-| Resource | Free Allowance | Cost After |
-|----------|---------------|------------|
-| **Shared CPU** | 3 shared CPUs | ~$2/mo |
-| **Memory** | 256MB | $0.03/GB/mo |
-| **Storage** | 3GB volumes | $0.15/GB/mo |
-| **Bandwidth** | 100GB | $0.02/GB |
-
-**Estimated Monthly Cost:** $0-5/mo for this bot
-
----
-
-## 🛡️ Features & Reliability
-
-| Feature | Implementation |
-|---------|----------------|
-| **Always-On** | `auto_stop_machines = false` |
-| **Persistent Data** | Volume mount at `/data` |
-| **Health Checks** | HTTP endpoint on port 8080 |
-| **Auto-Recovery** | Fly.io automatic restarts |
-| **WebSocket Reconnect** | Built-in with 15s delay |
-| **Multi-Source Prices** | Jupiter → DexScreener → Birdeye |
-
----
-
-## 📊 Code Statistics
-
-| Metric | Value |
-|--------|-------|
-| **Total Lines** | 7,795 |
-| **Functions** | 115+ |
-| **Commands** | 19 |
-| **Button Actions** | 74 |
-| **API Integrations** | 5+ |
-
----
+MIT License - feel free to use and modify.
 
 ## 🔗 Links
 
-- **Orbit Finance**: [markets.cipherlabsx.com](https://markets.cipherlabsx.com)
-- **Fly.io Docs**: [fly.io/docs](https://fly.io/docs)
-- **Helius**: [helius.dev](https://helius.dev)
+- **Bot:** [@OrbitFinanceTrackerBot](https://t.me/OrbitFinanceTrackerBot)
+- **Orbit Markets:** [markets.cipherlabsx.com](https://markets.cipherlabsx.com)
+- **GitHub:** [jorger3301/orbit-finance-tracker](https://github.com/jorger3301/orbit-finance-tracker)
 
 ---
 
-
-
-<p align="center">
-  <b>Built with ❤️ for the Cipher community</b>
-</p>
+Made with ❤️ for the Orbit Finance community

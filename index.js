@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// ORBIT TRACKER v10.9 - Production Grade Telegram Bot
+// ORBIT TRACKER v11.0 - Production Grade Telegram Bot
 // ═══════════════════════════════════════════════════════════════════════════════
 // Features: Portfolio tracking, Trade alerts, LP monitoring, Whale tracking,
 //           PnL Leaderboards, OHLCV Charts, Liquidity Alerts
@@ -1052,6 +1052,48 @@ function getSolPrice() {
   return null;
 }
 
+// Get CIPHER price - tries cache first, then fetches from APIs
+async function getCipherPrice() {
+  // Try cache first
+  let price = getPrice(MINTS.CIPHER);
+  if (price && price > 0) return price;
+  
+  // Try DexScreener
+  try {
+    const res = await fetchWithRetry(`${BACKUP_APIS.dexscreener}/${MINTS.CIPHER}`, {}, 2, 5000);
+    const data = await res.json();
+    if (data?.pairs?.[0]?.priceUsd) {
+      price = parseFloat(data.pairs[0].priceUsd);
+      priceCache.set(MINTS.CIPHER, {
+        price,
+        updatedAt: Date.now(),
+        source: 'dexscreener',
+      });
+      log.debug(`Fetched CIPHER price: $${price}`);
+      return price;
+    }
+  } catch (e) {}
+  
+  // Try Birdeye
+  try {
+    const res = await birdeyeFetch(BIRDEYE.price(MINTS.CIPHER));
+    const data = await res.json();
+    if (data?.data?.value) {
+      price = parseFloat(data.data.value);
+      priceCache.set(MINTS.CIPHER, {
+        price,
+        updatedAt: Date.now(),
+        source: 'birdeye',
+      });
+      log.debug(`Fetched CIPHER price from Birdeye: $${price}`);
+      return price;
+    }
+  } catch (e) {}
+  
+  log.warn('⚠️ Could not fetch CIPHER price');
+  return 0;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // TOKENS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1692,6 +1734,17 @@ function saveUser(user) {
       createdAt: user.createdAt || Date.now(),
       lastActive: user.lastActive || 0,
     });
+    
+    // Save portfolio wallets to separate table
+    const portfolioWallets = user.portfolioWallets || [];
+    if (portfolioWallets.length > 0) {
+      // Clear existing and re-insert
+      db.prepare('DELETE FROM portfolio_wallets WHERE chat_id = ?').run(user.chatId);
+      const insertWallet = db.prepare('INSERT INTO portfolio_wallets (chat_id, wallet, is_primary) VALUES (?, ?, ?)');
+      portfolioWallets.forEach((wallet, i) => {
+        insertWallet.run(user.chatId, wallet, i === 0 ? 1 : 0);
+      });
+    }
     
     log.debug(`💾 Saved user ${user.chatId}`);
   } catch (e) {
@@ -2817,8 +2870,17 @@ async function fetchTokenSupply(mint) {
   }
 }
 
+// Cache for global staking data
+let stakedCipherCache = { data: null, timestamp: 0 };
+const STAKED_CIPHER_CACHE_TTL = 60000; // 1 minute
+
 // Fetch total staked CIPHER data from stake pool
 async function fetchStakedCipher() {
+  // Return cached data if fresh
+  if (stakedCipherCache.data && Date.now() - stakedCipherCache.timestamp < STAKED_CIPHER_CACHE_TTL) {
+    return stakedCipherCache.data;
+  }
+  
   try {
     // Fetch both vault balance and receipt token supply in parallel
     const [vaultRes, receiptRes] = await Promise.all([
@@ -2852,13 +2914,19 @@ async function fetchStakedCipher() {
     const vaultBalance = parseFloat(vaultData?.result?.value?.uiAmountString || vaultData?.result?.value?.uiAmount || 0);
     const receiptSupply = parseFloat(receiptData?.result?.value?.uiAmountString || receiptData?.result?.value?.uiAmount || 0);
     
-    return {
+    const result = {
       stakedAmount: vaultBalance,      // Actual CIPHER in vault
       receiptSupply: receiptSupply,    // Total sCIPHER supply
     };
+    
+    // Cache the result
+    stakedCipherCache = { data: result, timestamp: Date.now() };
+    log.debug(`Staking pool: ${vaultBalance.toFixed(0)} CIPHER staked, ${receiptSupply.toFixed(0)} sCIPHER supply`);
+    
+    return result;
   } catch (e) {
     log.error('Staked CIPHER fetch error:', e.message);
-    return { stakedAmount: 0, receiptSupply: 0 };
+    return stakedCipherCache.data || { stakedAmount: 0, receiptSupply: 0 };
   }
 }
 
@@ -3052,8 +3120,8 @@ async function fetchUserStakedCipher(walletAddress) {
     // Try to find original stake from transaction history
     const originalStake = await fetchUserStakeFromHistory(walletAddress);
     
-    // Get CIPHER price
-    const cipherPrice = getPrice(MINTS.CIPHER) || 0;
+    // Get CIPHER price - try multiple sources
+    let cipherPrice = await getCipherPrice();
     
     if (originalStake && originalStake > 0) {
       // We found the original staked amount from history!
@@ -3074,6 +3142,8 @@ async function fetchUserStakedCipher(walletAddress) {
     const userShare = userScipherBalance / totalScipherSupply;
     const userVaultCipher = userShare * totalVaultCipher;
     const vaultShareValue = userVaultCipher * cipherPrice;
+    
+    log.debug(`Staked CIPHER calc: sCIPHER=${userScipherBalance}, share=${(userShare*100).toFixed(2)}%, vault=${userVaultCipher}, price=$${cipherPrice}, value=$${vaultShareValue}`);
     
     return {
       scipherBalance: userScipherBalance,
@@ -3160,6 +3230,74 @@ async function fetchCipherSupplyData() {
 // Format large numbers with K/M/B suffix (uses numeral)
 function fmtSupply(num) {
   return formatNumber(num, 2);
+}
+
+// Compact format for volumes (e.g. $1.2M)
+function fmtCompact(num) {
+  if (!num || isNaN(num)) return '$0';
+  if (num >= 1e9) return `$${(num / 1e9).toFixed(1)}B`;
+  if (num >= 1e6) return `$${(num / 1e6).toFixed(1)}M`;
+  if (num >= 1e3) return `$${(num / 1e3).toFixed(1)}K`;
+  return `$${num.toFixed(0)}`;
+}
+
+// Get pools sorted by volume, TVL, or trades
+function getSortedPools(sortBy = 'volume') {
+  const poolsWithData = pools.map(p => ({
+    ...p,
+    volume24h: orbitVolumes.pools?.[p.id]?.volume24h || 0,
+    tvl: p.tvl || p.liquidity || 0,
+    trades24h: orbitVolumes.pools?.[p.id]?.trades24h || 0,
+  }));
+  
+  switch (sortBy) {
+    case 'tvl':
+      return poolsWithData.sort((a, b) => b.tvl - a.tvl);
+    case 'trades':
+      return poolsWithData.sort((a, b) => b.trades24h - a.trades24h);
+    case 'volume':
+    default:
+      return poolsWithData.sort((a, b) => b.volume24h - a.volume24h);
+  }
+}
+
+// Get top N pools by 24h volume
+function getTopPoolsByVolume(n = 10) {
+  return getSortedPools('volume').slice(0, n);
+}
+
+// Get pool by ID
+function getPoolById(poolId) {
+  return poolMap.get(poolId) || pools.find(p => p.id === poolId);
+}
+
+// Get pools added in the last N hours
+function getNewPools(hours = 48) {
+  const cutoff = Date.now() - (hours * 60 * 60 * 1000);
+  return pools
+    .filter(p => p.createdAt && p.createdAt > cutoff)
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+}
+
+// Get human-readable pool age
+function getPoolAge(pool) {
+  if (!pool?.createdAt) return 'Unknown';
+  const hours = Math.floor((Date.now() - pool.createdAt) / (60 * 60 * 1000));
+  if (hours < 1) return 'Just now';
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+// Get pools with highest volume increase (gainers)
+function getTopGainers(limit = 10) {
+  return getSortedPools('volume').slice(0, limit);
+}
+
+// Get recent large trades across all pools
+function getRecentLargeTrades(minUsd = 1000, limit = 10) {
+  // This would need trade history tracking - for now return empty
+  return [];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -4401,20 +4539,25 @@ const menu = {
       [Markup.button.callback('🔷 CIPHER', 'nav:cipher'), Markup.button.callback('👛 Wallets', 'nav:wallets')],
     ];
     
-    if (u?.trackOtherPools !== false) {
-      btns.push([Markup.button.callback('💧 LP', 'nav:lp'), Markup.button.callback('⭐ Watchlist', 'nav:watchlist')]);
-    }
+    // Pool Explorer & Watchlist
+    btns.push([
+      Markup.button.callback('🌐 Pools', 'nav:pools'),
+      Markup.button.callback('⭐ Watchlist', 'nav:watchlist'),
+    ]);
     
-    // Portfolio button
-    btns.push([Markup.button.callback('📈 My Portfolio', 'nav:portfolio')]);
+    // LP & Portfolio
+    btns.push([
+      Markup.button.callback('💧 LP Alerts', 'nav:lp'),
+      Markup.button.callback('📈 Portfolio', 'nav:portfolio'),
+    ]);
     
-    const otherLabel = u?.trackOtherPools !== false ? '🟢 Other Pools' : '⚫ Other Pools';
+    const otherLabel = u?.trackOtherPools !== false ? '🟢 Other Alerts' : '⚫ Other Alerts';
     let alertLabel = '🔔 Alerts ON';
     if (!u?.enabled) alertLabel = '⏸️ Paused';
     else if (snoozed) alertLabel = quietActive ? '🌙 Quiet' : '🔕 Snoozed';
     
     btns.push([
-      Markup.button.callback(otherLabel, 'tog:trackOtherPools'),
+      Markup.button.callback(otherLabel, 'nav:othersettings'),
       Markup.button.callback(alertLabel, 'nav:snooze'),
     ]);
     btns.push([
@@ -4438,6 +4581,113 @@ const menu = {
     [Markup.button.callback(`${u?.otherLpAdd ? '✅' : '⬜'} LP Add Alerts`, 'tog:otherLpAdd'),
      Markup.button.callback(`${u?.otherLpRemove ? '✅' : '⬜'} LP Remove`, 'tog:otherLpRemove')],
     [Markup.button.callback(`💰 Minimum: ${fmt(u?.otherLpThreshold || 500)}`, 'thresh:lp')],
+    [Markup.button.callback('« Back to Menu', 'nav:main')],
+  ]),
+  
+  // Pool Explorer menu
+  pools: (u, page = 0, sortBy = 'volume') => {
+    const perPage = 5;
+    const sortedPools = getSortedPools(sortBy);
+    const start = page * perPage;
+    const slice = sortedPools.slice(start, start + perPage);
+    const totalPages = Math.ceil(sortedPools.length / perPage) || 1;
+    
+    const btns = [];
+    
+    // Sort buttons
+    btns.push([
+      Markup.button.callback(sortBy === 'volume' ? '📊 Volume ✓' : '📊 Volume', 'pools:sort:volume'),
+      Markup.button.callback(sortBy === 'tvl' ? '💰 TVL ✓' : '💰 TVL', 'pools:sort:tvl'),
+      Markup.button.callback(sortBy === 'trades' ? '🔄 Trades ✓' : '🔄 Trades', 'pools:sort:trades'),
+    ]);
+    
+    // Pool buttons
+    slice.forEach(p => {
+      const pairName = p.pairName || formatPair(p.baseMint || p.base, p.quoteMint || p.quote);
+      const vol = orbitVolumes.pools?.[p.id]?.volume24h || 0;
+      const volStr = vol > 0 ? ` • ${fmtCompact(vol)}` : '';
+      const icon = p.isCipher ? '🔷' : '🌐';
+      btns.push([Markup.button.callback(`${icon} ${pairName}${volStr}`, `pool:view:${p.id}`)]);
+    });
+    
+    // Pagination
+    const navBtns = [];
+    if (page > 0) navBtns.push(Markup.button.callback('◀️ Prev', `pools:page:${page - 1}:${sortBy}`));
+    navBtns.push(Markup.button.callback(`${page + 1}/${totalPages}`, 'noop'));
+    if (start + perPage < sortedPools.length) navBtns.push(Markup.button.callback('Next ▶️', `pools:page:${page + 1}:${sortBy}`));
+    btns.push(navBtns);
+    
+    // Action buttons
+    btns.push([
+      Markup.button.callback('🔥 Trending', 'nav:trending'),
+      Markup.button.callback('🆕 New', 'nav:newpools'),
+    ]);
+    btns.push([
+      Markup.button.callback('🔍 Search', 'pools:search'),
+      Markup.button.callback('⚙️ Alerts', 'nav:othersettings'),
+    ]);
+    btns.push([Markup.button.callback('« Back to Menu', 'nav:main')]);
+    
+    return Markup.inlineKeyboard(btns);
+  },
+  
+  // Trending pools menu
+  trending: () => {
+    const topPools = getTopPoolsByVolume(10);
+    const btns = [];
+    
+    topPools.forEach((p, i) => {
+      const pairName = p.pairName || formatPair(p.baseMint || p.base, p.quoteMint || p.quote);
+      const vol = orbitVolumes.pools?.[p.id]?.volume24h || 0;
+      const icon = p.isCipher ? '🔷' : '🌐';
+      const rank = ['🥇', '🥈', '🥉'][i] || `${i + 1}.`;
+      btns.push([Markup.button.callback(`${rank} ${icon} ${pairName} • ${fmtCompact(vol)}`, `pool:view:${p.id}`)]);
+    });
+    
+    btns.push([
+      Markup.button.callback('🆕 New Pools', 'nav:newpools'),
+      Markup.button.callback('📋 All Pools', 'nav:pools'),
+    ]);
+    btns.push([Markup.button.callback('« Menu', 'nav:main')]);
+    
+    return Markup.inlineKeyboard(btns);
+  },
+  
+  // Single pool view menu
+  poolView: (pool, user) => {
+    const poolId = pool?.id;
+    const inWatchlist = user?.watchlist?.includes(poolId);
+    
+    const btns = [
+      [Markup.button.callback('📊 Chart', `chart:${poolId}:1h`),
+       Markup.button.callback('📜 History', `liqhistory:${poolId}`)],
+      [Markup.button.callback('🏆 Leaderboard', `leaderboard:${pool?.baseMint || pool?.base}`)],
+      [Markup.button.callback(inWatchlist ? '⭐ Remove from Watchlist' : '☆ Add to Watchlist', `pool:watch:${poolId}`)],
+      [Markup.button.callback('🔗 Solscan', 'noop'), Markup.button.callback('🦅 Birdeye', 'noop')],
+      [Markup.button.callback('« Back', 'nav:pools'), Markup.button.callback('🏠 Menu', 'nav:main')],
+    ];
+    
+    // Replace noop with actual URLs
+    if (poolId) {
+      btns[3] = [
+        Markup.button.url('🔗 Solscan', `https://solscan.io/account/${poolId}`),
+        Markup.button.url('🦅 Birdeye', `https://birdeye.so/token/${pool?.baseMint || pool?.base}?chain=solana`),
+      ];
+    }
+    
+    return Markup.inlineKeyboard(btns);
+  },
+  
+  // Other pools settings
+  otherPoolSettings: (u) => Markup.inlineKeyboard([
+    [Markup.button.callback(`${u?.trackOtherPools !== false ? '✅' : '⬜'} Track Other Pools`, 'tog:trackOtherPools')],
+    [Markup.button.callback(`${u?.otherBuys ? '✅' : '⬜'} Buy Alerts`, 'tog:otherBuys'),
+     Markup.button.callback(`${u?.otherSells ? '✅' : '⬜'} Sell Alerts`, 'tog:otherSells')],
+    [Markup.button.callback(`${u?.otherLpAdd ? '✅' : '⬜'} LP Add`, 'tog:otherLpAdd'),
+     Markup.button.callback(`${u?.otherLpRemove ? '✅' : '⬜'} LP Remove`, 'tog:otherLpRemove')],
+    [Markup.button.callback(`💰 Trade Min: ${fmt(u?.otherThreshold || 500)}`, 'thresh:other')],
+    [Markup.button.callback(`💧 LP Min: ${fmt(u?.otherLpThreshold || 500)}`, 'thresh:lp')],
+    [Markup.button.callback('📋 Browse Pools', 'nav:pools')],
     [Markup.button.callback('« Back to Menu', 'nav:main')],
   ]),
   
@@ -4600,7 +4850,8 @@ const menu = {
       btns.push(row);
     }
     
-    const backNav = type === 'cipher' ? 'nav:cipher' : type === 'lp' ? 'nav:lp' : 'nav:watchlist';
+    const backNavMap = { cipher: 'nav:cipher', lp: 'nav:lp', other: 'nav:othersettings', watch: 'nav:watchlist' };
+    const backNav = backNavMap[type] || 'nav:main';
     btns.push([Markup.button.callback('« Back', backNav), Markup.button.callback('🏠 Menu', 'nav:main')]);
     return Markup.inlineKeyboard(btns);
   },
@@ -4797,10 +5048,11 @@ Your complete Orbit Finance companion.
 
 *What you'll get:*
 • 🔷 CIPHER trade & LP alerts
-• 👛 Wallet tracking
-• 💧 Liquidity monitoring
-• ⭐ Custom watchlists
-• 📈 Portfolio & PnL tracking`,
+• 🌐 Pool Explorer with trending & new pools
+• 👛 Whale wallet tracking
+• 📈 Portfolio & PnL analytics
+• 📊 Charts & leaderboards
+• ⭐ Custom watchlists`,
 
   dashboard: (u) => {
     const today = u?.todayStats || { trades: 0, lp: 0, wallet: 0 };
@@ -4936,6 +5188,79 @@ Use *Search* to find tokens by name or address, or *Browse* to see all pools.`;
     return `⭐ *Watchlist*
 
 Tracking *${count}* item${count !== 1 ? 's' : ''}.`;
+  },
+  
+  // Pool Explorer texts
+  pools: (sortBy = 'volume') => {
+    const total = pools.length;
+    const cipherCount = cipherPools.length;
+    const otherCount = otherPools.length;
+    const totalVol = orbitVolumes.total24h || 0;
+    
+    return `🌐 *Pool Explorer*
+
+*${total} pools* on Orbit Finance
+🔷 ${cipherCount} CIPHER pools
+🌐 ${otherCount} other pools
+
+📊 *24h Volume:* ${fmtCompact(totalVol)}
+
+_Sorted by ${sortBy === 'volume' ? '24h Volume' : sortBy === 'tvl' ? 'TVL' : 'Trade Count'}_`;
+  },
+  
+  trending: () => {
+    const totalVol = orbitVolumes.total24h || 0;
+    return `🔥 *Trending Pools*
+
+Top pools by 24h trading volume.
+
+📊 *Total 24h Volume:* ${fmtCompact(totalVol)}
+
+_Tap a pool for details, charts, and leaderboards._`;
+  },
+  
+  poolView: (pool) => {
+    if (!pool) return `❌ Pool not found`;
+    
+    const pairName = pool.pairName || formatPair(pool.baseMint || pool.base, pool.quoteMint || pool.quote);
+    const vol24h = orbitVolumes.pools?.[pool.id]?.volume24h || 0;
+    const trades24h = orbitVolumes.pools?.[pool.id]?.trades24h || 0;
+    const tvl = pool.tvl || pool.liquidity || 0;
+    const fee = pool.fee || pool.feeRate || 0;
+    const icon = pool.isCipher ? '🔷' : '🌐';
+    
+    // Get base token price
+    const baseMint = pool.baseMint || pool.base;
+    const basePrice = getPrice(baseMint) || 0;
+    const priceStr = basePrice > 0 ? `$${basePrice < 0.01 ? basePrice.toFixed(6) : basePrice.toFixed(4)}` : 'N/A';
+    
+    return `${icon} *${pairName}*
+
+💵 *Price:* ${priceStr}
+📊 *24h Volume:* ${fmtCompact(vol24h)}
+🔄 *24h Trades:* ${trades24h}
+💰 *TVL:* ${fmtCompact(tvl)}
+💸 *Fee:* ${(fee * 100).toFixed(2)}%
+
+\`${pool.id?.slice(0, 20)}...\``;
+  },
+  
+  otherPoolSettings: (u) => {
+    const alerts = [];
+    if (u?.otherBuys) alerts.push('Buys');
+    if (u?.otherSells) alerts.push('Sells');
+    if (u?.otherLpAdd) alerts.push('LP+');
+    if (u?.otherLpRemove) alerts.push('LP-');
+    const alertStr = alerts.length > 0 ? alerts.join(', ') : 'None';
+    
+    return `🌐 *Other Pools Settings*
+
+*Status:* ${u?.trackOtherPools !== false ? '✅ Tracking' : '⬜ Disabled'}
+*Alerts:* ${alertStr}
+*Trade Minimum:* ${fmt(u?.otherThreshold || 500)}
+*LP Minimum:* ${fmt(u?.otherLpThreshold || 500)}
+
+_Configure alerts for all non-CIPHER pools on Orbit._`;
   },
   
   snooze: (u) => {
@@ -5095,7 +5420,15 @@ _Add up to 5 wallets_`;
     }
     if (tokenValue > 0) holdingsText += `🪙 Tokens: ${fmt(tokenValue)} (${p.tokenCount || 0})\n`;
     if (lpValue > 0) holdingsText += `💧 LP: ${fmt(lpValue)} (${p.lpPositions?.length || 0})\n`;
-    if (stakedValue > 0) holdingsText += `🔒 Staked: ${fmt(stakedValue)}\n`;
+    
+    // Show staked CIPHER - even if value is 0, show the sCIPHER balance
+    const scipherBalance = parseFloat(p.totalScipherBalance) || 0;
+    if (stakedValue > 0) {
+      holdingsText += `🔒 Staked: ${fmt(stakedValue)}\n`;
+    } else if (scipherBalance > 0) {
+      // Show sCIPHER balance even if value couldn't be calculated
+      holdingsText += `🔒 Staked: ${fmtSupply(scipherBalance)} sCIPHER\n`;
+    }
     
     if (!holdingsText) holdingsText = '_Syncing..._\n';
     
@@ -5473,6 +5806,11 @@ bot.command('help', async (ctx) => {
 /refresh — Sync portfolio data
 /wallets — Manage tracked wallets
 
+*Pool Explorer:*
+/pools — Browse all pools
+/trending — Top pools by volume
+/newpools — Recently added pools
+
 *Market Info:*
 /price — SOL & CIPHER prices
 /cipher — CIPHER token stats
@@ -5496,7 +5834,7 @@ _Tip: Use the menu buttons for full features!_`;
     await ctx.reply(helpMsg, { 
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
-        [Markup.button.callback('📊 Chart', 'chart:cipher'), Markup.button.callback('🏆 Leaders', 'leaderboard:cipher')],
+        [Markup.button.callback('🌐 Pools', 'nav:pools'), Markup.button.callback('🔥 Trending', 'nav:trending')],
         [Markup.button.callback('📈 Portfolio', 'nav:portfolio'), Markup.button.callback('⚙️ Settings', 'nav:settings')],
         [Markup.button.callback('🏠 Menu', 'nav:main')],
       ])
@@ -5609,6 +5947,49 @@ bot.command('wallets', async (ctx) => {
     await ctx.reply(text.wallets(user), { parse_mode: 'Markdown', ...menu.wallets(user) });
   } catch (e) {
     await ctx.reply('❌ Failed to load wallets.');
+  }
+});
+
+// Pool Explorer commands
+bot.command('pools', async (ctx) => {
+  try {
+    const user = getUser(ctx.chat.id) || createUser(ctx.chat.id);
+    await ctx.reply(text.pools('volume'), { parse_mode: 'Markdown', ...menu.pools(user, 0, 'volume') });
+  } catch (e) {
+    await ctx.reply('❌ Failed to load pools.');
+  }
+});
+
+bot.command('trending', async (ctx) => {
+  try {
+    await ctx.reply(text.trending(), { parse_mode: 'Markdown', ...menu.trending() });
+  } catch (e) {
+    await ctx.reply('❌ Failed to load trending pools.');
+  }
+});
+
+bot.command('newpools', async (ctx) => {
+  try {
+    const newPools = getNewPools(48); // Pools added in last 48 hours
+    if (newPools.length === 0) {
+      await ctx.reply('📭 *No new pools*\n\nNo new pools have been added in the last 48 hours.', { parse_mode: 'Markdown' });
+      return;
+    }
+    
+    const btns = newPools.slice(0, 10).map(p => {
+      const pairName = p.pairName || formatPair(p.baseMint || p.base, p.quoteMint || p.quote);
+      const age = getPoolAge(p);
+      const icon = p.isCipher ? '🔷' : '🌐';
+      return [Markup.button.callback(`${icon} ${pairName} • ${age}`, `pool:view:${p.id}`)];
+    });
+    btns.push([Markup.button.callback('📋 All Pools', 'nav:pools'), Markup.button.callback('🏠 Menu', 'nav:main')]);
+    
+    await ctx.reply(`🆕 *New Pools*\n\n${newPools.length} pool${newPools.length !== 1 ? 's' : ''} added in the last 48h:`, { 
+      parse_mode: 'Markdown', 
+      ...Markup.inlineKeyboard(btns) 
+    });
+  } catch (e) {
+    await ctx.reply('❌ Failed to load new pools.');
   }
 });
 
@@ -6178,6 +6559,121 @@ bot.action('nav:watchlist', async (ctx) => {
   await safeAnswer(ctx);
 });
 
+// Pool Explorer navigation
+bot.action('nav:pools', async (ctx) => {
+  const user = getUser(ctx.chat.id);
+  await safeEdit(ctx, text.pools('volume'), { parse_mode: 'Markdown', ...menu.pools(user, 0, 'volume') });
+  await safeAnswer(ctx);
+});
+
+bot.action('nav:trending', async (ctx) => {
+  await safeEdit(ctx, text.trending(), { parse_mode: 'Markdown', ...menu.trending() });
+  await safeAnswer(ctx);
+});
+
+bot.action('nav:newpools', async (ctx) => {
+  const newPools = getNewPools(48);
+  
+  if (newPools.length === 0) {
+    await safeEdit(ctx, `🆕 *New Pools*\n\nNo new pools added in the last 48 hours.`, { 
+      parse_mode: 'Markdown', 
+      ...Markup.inlineKeyboard([[Markup.button.callback('« Back', 'nav:pools')]]) 
+    });
+    await safeAnswer(ctx);
+    return;
+  }
+  
+  const btns = newPools.slice(0, 10).map(p => {
+    const pairName = p.pairName || formatPair(p.baseMint || p.base, p.quoteMint || p.quote);
+    const age = getPoolAge(p);
+    const icon = p.isCipher ? '🔷' : '🌐';
+    return [Markup.button.callback(`${icon} ${pairName} • ${age}`, `pool:view:${p.id}`)];
+  });
+  btns.push([Markup.button.callback('📋 All Pools', 'nav:pools'), Markup.button.callback('🏠 Menu', 'nav:main')]);
+  
+  await safeEdit(ctx, `🆕 *New Pools*\n\n${newPools.length} pool${newPools.length !== 1 ? 's' : ''} added recently:`, { 
+    parse_mode: 'Markdown', 
+    ...Markup.inlineKeyboard(btns) 
+  });
+  await safeAnswer(ctx);
+});
+
+bot.action('nav:othersettings', async (ctx) => {
+  const user = getUser(ctx.chat.id);
+  await safeEdit(ctx, text.otherPoolSettings(user), { parse_mode: 'Markdown', ...menu.otherPoolSettings(user) });
+  await safeAnswer(ctx);
+});
+
+// Pool pagination
+bot.action(/^pools:page:(\d+):(\w+)$/, async (ctx) => {
+  const page = parseInt(ctx.match[1]);
+  const sortBy = ctx.match[2];
+  const user = getUser(ctx.chat.id);
+  await safeEdit(ctx, text.pools(sortBy), { parse_mode: 'Markdown', ...menu.pools(user, page, sortBy) });
+  await safeAnswer(ctx);
+});
+
+// Pool sorting
+bot.action(/^pools:sort:(\w+)$/, async (ctx) => {
+  const sortBy = ctx.match[1];
+  const user = getUser(ctx.chat.id);
+  await safeEdit(ctx, text.pools(sortBy), { parse_mode: 'Markdown', ...menu.pools(user, 0, sortBy) });
+  await safeAnswer(ctx, `Sorted by ${sortBy}`);
+});
+
+// Pool search prompt
+bot.action('pools:search', async (ctx) => {
+  setUserState(ctx.chat.id, { awaiting: 'poolSearch' });
+  await safeEdit(ctx, `🔍 *Search Pools*
+
+Enter a token name or symbol (e.g. "SOL", "BONK"):`, { 
+    parse_mode: 'Markdown', 
+    ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'nav:pools')]]) 
+  });
+  await safeAnswer(ctx);
+});
+
+// View single pool
+bot.action(/^pool:view:(.+)$/, async (ctx) => {
+  const poolId = ctx.match[1];
+  const pool = getPoolById(poolId);
+  const user = getUser(ctx.chat.id);
+  
+  if (!pool) {
+    await safeAnswer(ctx, '❌ Pool not found');
+    return;
+  }
+  
+  await safeEdit(ctx, text.poolView(pool), { parse_mode: 'Markdown', ...menu.poolView(pool, user) });
+  await safeAnswer(ctx);
+});
+
+// Toggle pool watchlist
+bot.action(/^pool:watch:(.+)$/, async (ctx) => {
+  const poolId = ctx.match[1];
+  const user = getUser(ctx.chat.id);
+  if (!user) return;
+  
+  if (!user.watchlist) user.watchlist = [];
+  
+  const index = user.watchlist.indexOf(poolId);
+  if (index > -1) {
+    user.watchlist.splice(index, 1);
+    await safeAnswer(ctx, '⭐ Removed from watchlist');
+  } else {
+    user.watchlist.push(poolId);
+    await safeAnswer(ctx, '⭐ Added to watchlist!');
+  }
+  
+  saveUsersDebounced();
+  
+  // Refresh the view
+  const pool = getPoolById(poolId);
+  if (pool) {
+    await safeEdit(ctx, text.poolView(pool), { parse_mode: 'Markdown', ...menu.poolView(pool, user) });
+  }
+});
+
 bot.action('nav:allwatchlist', async (ctx) => {
   const user = getUser(ctx.chat.id);
   const btns = [];
@@ -6598,7 +7094,7 @@ bot.action(/^tog:(.+)$/, async (ctx) => {
 bot.action(/^thresh:(.+)$/, async (ctx) => {
   const type = ctx.match[1];
   const user = getUser(ctx.chat.id);
-  const currentMap = { cipher: user?.cipherThreshold, lp: user?.otherLpThreshold, watch: user?.otherThreshold };
+  const currentMap = { cipher: user?.cipherThreshold, lp: user?.otherLpThreshold, other: user?.otherThreshold, watch: user?.otherThreshold };
   await safeEdit(ctx, `💰 *Set Minimum Amount*\n\nOnly get alerts above this value:`, { parse_mode: 'Markdown', ...menu.threshold(type, currentMap[type]) });
   await safeAnswer(ctx);
 });
@@ -6606,7 +7102,7 @@ bot.action(/^thresh:(.+)$/, async (ctx) => {
 bot.action(/^setth:(.+):(\d+)$/, async (ctx) => {
   const type = ctx.match[1];
   const val = parseInt(ctx.match[2]);
-  const fieldMap = { cipher: 'cipherThreshold', lp: 'otherLpThreshold', watch: 'otherThreshold' };
+  const fieldMap = { cipher: 'cipherThreshold', lp: 'otherLpThreshold', other: 'otherThreshold', watch: 'otherThreshold' };
   updateUser(ctx.chat.id, { [fieldMap[type]]: val });
   
   const user = getUser(ctx.chat.id);
@@ -6614,6 +7110,7 @@ bot.action(/^setth:(.+):(\d+)$/, async (ctx) => {
   
   if (type === 'cipher') await safeEdit(ctx, text.cipher(user), { parse_mode: 'Markdown', ...menu.cipher(user) });
   else if (type === 'lp') await safeEdit(ctx, text.lp(user), { parse_mode: 'Markdown', ...menu.lp(user) });
+  else if (type === 'other') await safeEdit(ctx, text.otherPoolSettings(user), { parse_mode: 'Markdown', ...menu.otherPoolSettings(user) });
   else await safeEdit(ctx, text.watchlist(user), { parse_mode: 'Markdown', ...menu.watchlist(user) });
 });
 
@@ -6770,19 +7267,6 @@ bot.action(/^confirm:rmtoken:(.+)$/, async (ctx) => {
   await safeAnswer(ctx);
 });
 
-bot.action(/^do:rmtoken:(.+)$/, async (ctx) => {
-  const mint = ctx.match[1];
-  const user = getUser(ctx.chat.id);
-  
-  if (user) {
-    user.trackedTokens = (user.trackedTokens || []).filter(t => t !== mint);
-    saveUsersDebounced();  // Debounced for performance
-  }
-  
-  await safeAnswer(ctx, '✅ Token removed');
-  await safeEdit(ctx, text.watchlist(user), { parse_mode: 'Markdown', ...menu.watchlist(user) });
-});
-
 // Pool removal confirmation
 bot.action(/^confirm:rmpool:(.+)$/, async (ctx) => {
   const poolId = ctx.match[1];
@@ -6797,19 +7281,6 @@ bot.action(/^confirm:rmpool:(.+)$/, async (ctx) => {
     ])
   });
   await safeAnswer(ctx);
-});
-
-bot.action(/^do:rmpool:(.+)$/, async (ctx) => {
-  const poolId = ctx.match[1];
-  const user = getUser(ctx.chat.id);
-  
-  if (user) {
-    user.watchlist = (user.watchlist || []).filter(id => id !== poolId);
-    saveUsersDebounced();  // Debounced for performance
-  }
-  
-  await safeAnswer(ctx, '✅ Pool removed');
-  await safeEdit(ctx, text.watchlist(user), { parse_mode: 'Markdown', ...menu.watchlist(user) });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -7100,6 +7571,49 @@ bot.on('text', async (ctx) => {
           return;
         }
         await ctx.reply(`🔍 *Results for "${searchQuery}"*\n\n*${results.length} pool${results.length !== 1 ? 's' : ''} found:*`, { parse_mode: 'Markdown', ...menu.searchResults(results, user) });
+      }
+    }
+    
+    // Pool Explorer search
+    if (state.awaiting === 'poolSearch') {
+      const searchQuery = sanitizeInput(input, 50);
+      
+      // Check if it's a token address
+      if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(searchQuery)) {
+        const tokenPools = findPoolsByToken(searchQuery);
+        if (tokenPools.length === 0) {
+          await ctx.reply('❌ *No pools found*\n\nThis token doesn\'t have any Orbit pools.', { 
+            parse_mode: 'Markdown', 
+            ...Markup.inlineKeyboard([[Markup.button.callback('🔍 Try Again', 'pools:search')], [Markup.button.callback('« Back', 'nav:pools')]]) 
+          });
+          return;
+        }
+        const pool = tokenPools[0];
+        await ctx.reply(text.poolView(pool), { parse_mode: 'Markdown', ...menu.poolView(pool, user) });
+      } else {
+        // Search by name/symbol
+        const results = searchPools(searchQuery);
+        if (results.length === 0) {
+          await ctx.reply(`❌ *No results for "${searchQuery}"*\n\nTry a different search term.`, { 
+            parse_mode: 'Markdown', 
+            ...Markup.inlineKeyboard([[Markup.button.callback('🔍 Try Again', 'pools:search')], [Markup.button.callback('« Back', 'nav:pools')]]) 
+          });
+          return;
+        }
+        
+        // Show search results with pool buttons
+        const btns = results.slice(0, 8).map(p => {
+          const pairName = p.pairName || formatPair(p.baseMint || p.base, p.quoteMint || p.quote);
+          const vol = orbitVolumes.pools?.[p.id]?.volume24h || 0;
+          const icon = p.isCipher ? '🔷' : '🌐';
+          return [Markup.button.callback(`${icon} ${pairName} • ${fmtCompact(vol)}`, `pool:view:${p.id}`)];
+        });
+        btns.push([Markup.button.callback('🔍 Search Again', 'pools:search'), Markup.button.callback('« Back', 'nav:pools')]);
+        
+        await ctx.reply(`🔍 *Results for "${searchQuery}"*\n\n*${results.length} pool${results.length !== 1 ? 's' : ''} found:*`, { 
+          parse_mode: 'Markdown', 
+          ...Markup.inlineKeyboard(btns) 
+        });
       }
     }
     
@@ -7543,7 +8057,7 @@ ${size.bar} ${size.tier}
 bot.catch((err) => log.error('Bot error:', err.message));
 
 async function start() {
-  log.info('🚀 Orbit Tracker v10.9\n');
+  log.info('🚀 Orbit Tracker v11.0\n');
   log.info(`📁 Data directory: ${DATA_DIR}`);
   log.info(`🐛 Debug mode: ${CONFIG.debug ? 'ON' : 'OFF'}`);
   
@@ -7654,6 +8168,9 @@ async function start() {
     { command: 'pnl', description: 'Quick PnL summary' },
     { command: 'lp', description: 'View LP positions' },
     { command: 'refresh', description: 'Sync portfolio data' },
+    { command: 'pools', description: 'Browse all pools' },
+    { command: 'trending', description: 'Top pools by volume' },
+    { command: 'newpools', description: 'Recently added pools' },
     { command: 'price', description: 'SOL & CIPHER prices' },
     { command: 'cipher', description: 'CIPHER token stats' },
     { command: 'chart', description: 'Price chart' },
@@ -7677,7 +8194,7 @@ async function start() {
     if (req.url === '/health' || req.url === '/') {
       const health = {
         status: 'ok',
-        version: '10.9.0',
+        version: '11.0.0',
         uptime: Math.floor((Date.now() - botStartTime) / 1000),
         users: users.size,
         pools: pools.length,
@@ -7703,7 +8220,7 @@ async function start() {
   
   console.log(`
 ╔════════════════════════════════════════════════════╗
-║  🚀 ORBIT TRACKER v10.9 (Production)               ║
+║  🚀 ORBIT TRACKER v11.0 (Production)               ║
 ╠════════════════════════════════════════════════════╣
 ║  🔷 ${String(cipherPools.length).padEnd(3)} CIPHER pools                        ║
 ║  🌐 ${String(otherPools.length).padEnd(3)} other pools                          ║
