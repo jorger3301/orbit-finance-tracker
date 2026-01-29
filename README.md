@@ -254,11 +254,7 @@ fly dashboard
 
 ---
 
-## 📄 License
 
-MIT License
-
----
 
 <p align="center">
   <b>Built with ❤️ for the Cipher community</b>
