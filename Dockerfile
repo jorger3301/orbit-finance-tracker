@@ -1,24 +1,12 @@
 # Orbit Tracker v11.0 - Production Dockerfile
-# Multi-stage build for smaller image size
 
-FROM node:18-alpine AS builder
+FROM node:18-alpine
 
-# Install build dependencies for native modules
+# Install dependencies for native modules and canvas
 RUN apk add --no-cache \
     python3 \
     make \
     g++ \
-    sqlite-dev
-
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --only=production
-
-# Production image
-FROM node:18-alpine
-
-# Install runtime dependencies for native modules and canvas
-RUN apk add --no-cache \
     sqlite-dev \
     cairo-dev \
     pango-dev \
@@ -31,12 +19,16 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-# Copy built node_modules from builder
-COPY --from=builder /app/node_modules ./node_modules
+# Copy package files
 COPY package*.json ./
+
+# Install dependencies
+RUN npm install --production
+
+# Copy app code
 COPY index.js ./
 
-# Create data directory for SQLite
+# Create data directory
 RUN mkdir -p /data && chown -R node:node /data /app
 
 # Switch to non-root user
