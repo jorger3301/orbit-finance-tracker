@@ -1,13 +1,35 @@
+# Dependencies
 node_modules/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Database
 data/
 *.db
-.env
-.env.*
-.git/
-.gitignore
-*.md
-!README.md
+*.db-journal
+
+# Logs
+logs/
 *.log
-*.zip
+npm-debug.log*
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Fly.io
 .fly/
+
+# Misc
+*.tmp
+*.bak
+*.zip
