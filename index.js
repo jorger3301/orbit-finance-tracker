@@ -74,6 +74,7 @@ const CONFIG = {
   // Limits
   maxWalletsPerUser: parseInt(process.env.MAX_WALLETS_PER_USER) || 10,
   maxRecentAlerts: parseInt(process.env.MAX_RECENT_ALERTS) || 10,
+  maxWatchlistItems: parseInt(process.env.MAX_WATCHLIST_ITEMS) || 50,
   maxCacheSize: parseInt(process.env.MAX_CACHE_SIZE) || 1000,
   
   // Features
@@ -349,6 +350,13 @@ const TX_TYPE = {
   SWAP: 'swap',
   LP_ADD: 'lp_add',
   LP_REMOVE: 'lp_remove',
+  CLOSE_POSITION: 'close_position',
+  LOCK_LIQUIDITY: 'lock_liquidity',
+  UNLOCK_LIQUIDITY: 'unlock_liquidity',
+  POOL_INIT: 'pool_init',
+  FEES_DISTRIBUTED: 'fees_distributed',
+  CLAIM_REWARDS: 'claim_rewards',
+  SYNC_STAKE: 'sync_stake',
   UNKNOWN: 'unknown',
 };
 
@@ -358,13 +366,25 @@ const TX_TYPE = {
  */
 const ORBIT_DISCRIMINATORS = {
   instructions: {
+    // Swap (both IDL versions — program may use either name)
+    swap: [248, 198, 158, 145, 225, 117, 135, 200],
     swap_v2: [43, 4, 237, 11, 26, 201, 30, 98],
+    // Liquidity
     add_liquidity_v2: [126, 118, 210, 37, 80, 190, 19, 105],
+    add_liquidity_batch: [254, 87, 215, 234, 0, 131, 76, 231],
+    // Withdraw (both IDL versions)
+    withdraw: [183, 18, 70, 156, 148, 109, 161, 34],
     withdraw_v2: [242, 80, 163, 0, 196, 221, 194, 194],
+    close_position: [123, 134, 81, 0, 49, 68, 98, 98],
+    // Pool management
     init_pool: [116, 233, 199, 204, 115, 159, 171, 36],
     init_position: [197, 20, 10, 1, 97, 160, 177, 91],
     lock_liquidity: [179, 201, 236, 158, 212, 98, 70, 182],
     unlock_liquidity: [154, 98, 151, 31, 8, 180, 144, 1],
+    // Staking / Rewards
+    claim_holder_rewards: [79, 182, 142, 158, 108, 127, 120, 174],
+    claim_nft_rewards: [155, 218, 162, 252, 207, 252, 197, 230],
+    sync_holder_stake: [151, 230, 186, 138, 237, 187, 231, 155],
   },
   events: {
     SwapExecuted: [150, 166, 26, 225, 28, 89, 38, 79],
@@ -373,6 +393,11 @@ const ORBIT_DISCRIMINATORS = {
     LiquidityWithdrawnAdmin: [236, 107, 253, 125, 227, 157, 155, 123],
     PoolInitialized: [100, 118, 173, 87, 12, 198, 254, 229],
     FeesDistributed: [209, 24, 174, 200, 236, 90, 154, 55],
+    LiquidityLocked: [150, 201, 204, 183, 217, 13, 119, 185],
+    LiquidityUnlocked: [123, 220, 231, 215, 36, 204, 249, 173],
+    ClaimHolderRewardsEvent: [97, 42, 168, 9, 85, 193, 87, 102],
+    ClaimNftRewardsEvent: [11, 114, 211, 206, 227, 26, 6, 26],
+    SyncHolderStakeEvent: [47, 69, 233, 184, 242, 2, 125, 106],
   },
 };
 
@@ -391,13 +416,28 @@ function arraysEqual(a, b) {
 // Detect from raw instruction data (8-byte discriminator)
 function detectFromInstructionData(data) {
   if (!data || data.length < 8) return TX_TYPE.UNKNOWN;
-  
+
   const disc = Array.from(data.slice(0, 8));
-  
-  if (arraysEqual(disc, ORBIT_DISCRIMINATORS.instructions.swap_v2)) return TX_TYPE.SWAP;
-  if (arraysEqual(disc, ORBIT_DISCRIMINATORS.instructions.add_liquidity_v2)) return TX_TYPE.LP_ADD;
-  if (arraysEqual(disc, ORBIT_DISCRIMINATORS.instructions.withdraw_v2)) return TX_TYPE.LP_REMOVE;
-  
+  const ix = ORBIT_DISCRIMINATORS.instructions;
+
+  // Swaps (both IDL versions)
+  if (arraysEqual(disc, ix.swap) || arraysEqual(disc, ix.swap_v2)) return TX_TYPE.SWAP;
+  // Liquidity add (single + batch)
+  if (arraysEqual(disc, ix.add_liquidity_v2) || arraysEqual(disc, ix.add_liquidity_batch)) return TX_TYPE.LP_ADD;
+  // Liquidity remove (both IDL versions)
+  if (arraysEqual(disc, ix.withdraw) || arraysEqual(disc, ix.withdraw_v2)) return TX_TYPE.LP_REMOVE;
+  // Close position (removes liquidity + closes account)
+  if (arraysEqual(disc, ix.close_position)) return TX_TYPE.CLOSE_POSITION;
+  // Liquidity locking/unlocking
+  if (arraysEqual(disc, ix.lock_liquidity)) return TX_TYPE.LOCK_LIQUIDITY;
+  if (arraysEqual(disc, ix.unlock_liquidity)) return TX_TYPE.UNLOCK_LIQUIDITY;
+  // Pool/position management
+  if (arraysEqual(disc, ix.init_pool)) return TX_TYPE.POOL_INIT;
+  if (arraysEqual(disc, ix.init_position)) return TX_TYPE.LP_ADD; // opening a position = preparing to add liquidity
+  // Reward claims & staking
+  if (arraysEqual(disc, ix.claim_holder_rewards) || arraysEqual(disc, ix.claim_nft_rewards)) return TX_TYPE.CLAIM_REWARDS;
+  if (arraysEqual(disc, ix.sync_holder_stake)) return TX_TYPE.SYNC_STAKE;
+
   return TX_TYPE.UNKNOWN;
 }
 
@@ -427,11 +467,30 @@ function detectFromLogs(logs) {
       if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.LiquidityWithdrawnAdmin)) {
         return { type: TX_TYPE.LP_REMOVE, eventName: 'LiquidityWithdrawnAdmin' };
       }
+      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.PoolInitialized)) {
+        return { type: TX_TYPE.POOL_INIT, eventName: 'PoolInitialized' };
+      }
+      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.FeesDistributed)) {
+        return { type: TX_TYPE.FEES_DISTRIBUTED, eventName: 'FeesDistributed' };
+      }
+      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.LiquidityLocked)) {
+        return { type: TX_TYPE.LOCK_LIQUIDITY, eventName: 'LiquidityLocked' };
+      }
+      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.LiquidityUnlocked)) {
+        return { type: TX_TYPE.UNLOCK_LIQUIDITY, eventName: 'LiquidityUnlocked' };
+      }
+      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.ClaimHolderRewardsEvent) ||
+          arraysEqual(disc, ORBIT_DISCRIMINATORS.events.ClaimNftRewardsEvent)) {
+        return { type: TX_TYPE.CLAIM_REWARDS, eventName: 'ClaimRewards' };
+      }
+      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.SyncHolderStakeEvent)) {
+        return { type: TX_TYPE.SYNC_STAKE, eventName: 'SyncHolderStake' };
+      }
     } catch (e) {
       // Continue to next log
     }
   }
-  
+
   return { type: TX_TYPE.UNKNOWN, eventName: null };
 }
 
@@ -483,6 +542,31 @@ function detectTransactionType(message) {
       explicitType.includes('liquiditywithdrawn')) {
     return { type: TX_TYPE.LP_REMOVE, direction: 'remove', confidence: 'high' };
   }
+  if (explicitType.includes('close_position') || explicitType === 'closeposition') {
+    return { type: TX_TYPE.CLOSE_POSITION, direction: 'remove', confidence: 'high' };
+  }
+  if (explicitType.includes('init_pool') || explicitType === 'poolinitialized') {
+    return { type: TX_TYPE.POOL_INIT, direction: null, confidence: 'high' };
+  }
+  if (explicitType.includes('claim_holder_rewards') || explicitType.includes('claim_nft_rewards') ||
+      explicitType.includes('claimrewards')) {
+    return { type: TX_TYPE.CLAIM_REWARDS, direction: null, confidence: 'high' };
+  }
+  if (explicitType === 'feesdistributed' || explicitType === 'fees_distributed') {
+    return { type: TX_TYPE.FEES_DISTRIBUTED, direction: null, confidence: 'high' };
+  }
+  if (explicitType.includes('lock_liquidity') || explicitType === 'liquiditylocked') {
+    return { type: TX_TYPE.LOCK_LIQUIDITY, direction: null, confidence: 'high' };
+  }
+  if (explicitType.includes('unlock_liquidity') || explicitType === 'liquidityunlocked') {
+    return { type: TX_TYPE.UNLOCK_LIQUIDITY, direction: null, confidence: 'high' };
+  }
+  if (explicitType.includes('sync_holder_stake') || explicitType === 'syncholderstakeevent') {
+    return { type: TX_TYPE.SYNC_STAKE, direction: null, confidence: 'high' };
+  }
+  if (explicitType === 'init_position' || explicitType === 'initposition') {
+    return { type: TX_TYPE.LP_ADD, direction: 'add', confidence: 'high' };
+  }
   
   // Method 2: Instruction data discriminator (Anchor)
   if (message.instructionData || message.data) {
@@ -499,19 +583,21 @@ function detectTransactionType(message) {
     if (buffer) {
       const detected = detectFromInstructionData(buffer);
       if (detected !== TX_TYPE.UNKNOWN) {
-        const direction = detected === TX_TYPE.SWAP ? getSwapDirection(message) : 
-                         detected === TX_TYPE.LP_ADD ? 'add' : 'remove';
+        const direction = detected === TX_TYPE.SWAP ? getSwapDirection(message) :
+                         detected === TX_TYPE.LP_ADD ? 'add' :
+                         (detected === TX_TYPE.LP_REMOVE || detected === TX_TYPE.CLOSE_POSITION) ? 'remove' : null;
         return { type: detected, direction, confidence: 'high' };
       }
     }
   }
-  
+
   // Method 3: Check logs for Anchor events
   if (message.logs) {
     const { type } = detectFromLogs(message.logs);
     if (type !== TX_TYPE.UNKNOWN) {
       const direction = type === TX_TYPE.SWAP ? getSwapDirection(message) :
-                       type === TX_TYPE.LP_ADD ? 'add' : 'remove';
+                       type === TX_TYPE.LP_ADD ? 'add' :
+                       type === TX_TYPE.LP_REMOVE ? 'remove' : null;
       return { type, direction, confidence: 'high' };
     }
   }
@@ -637,16 +723,22 @@ function isValidSignature(sig) {
 
 // Format currency amounts
 function formatCurrency(value, compact = true) {
-  if (value === null || value === undefined || isNaN(value)) return '$0';
+  if (value === null || value === undefined || isNaN(value)) return '--';
+  if (value === 0) return '$0';
+  const neg = value < 0;
+  const abs = Math.abs(value);
+  let formatted;
   if (compact) {
-    if (value >= 1e9) return numeral(value).format('$0.00a').toUpperCase();
-    if (value >= 1e6) return numeral(value).format('$0.00a').toUpperCase();
-    if (value >= 1e3) return numeral(value).format('$0.0a').toUpperCase();
-    if (value >= 1) return numeral(value).format('$0.00');
-    if (value >= 0.01) return numeral(value).format('$0.00');
-    return '<$0.01';
+    if (abs >= 1e9) formatted = numeral(abs).format('$0.00a').toUpperCase();
+    else if (abs >= 1e6) formatted = numeral(abs).format('$0.00a').toUpperCase();
+    else if (abs >= 1e3) formatted = numeral(abs).format('$0.0a').toUpperCase();
+    else if (abs >= 1) formatted = numeral(abs).format('$0.00');
+    else if (abs >= 0.01) formatted = numeral(abs).format('$0.00');
+    else formatted = '<$0.01';
+  } else {
+    formatted = numeral(abs).format('$0,0.00');
   }
-  return numeral(value).format('$0,0.00');
+  return neg ? `-${formatted}` : formatted;
 }
 
 // Format large numbers (for supplies, balances)
@@ -807,16 +899,17 @@ function debounce(fn, delay) {
   let timeoutId = null;
   let pendingPromise = null;
   let pendingResolve = null;
-  
+
   return function(...args) {
-    if (timeoutId) clearTimeout(timeoutId);
-    
+    // Don't reset timer — prevents starvation from rapid calls
     if (!pendingPromise) {
       pendingPromise = new Promise(resolve => {
         pendingResolve = resolve;
       });
     }
-    
+
+    if (timeoutId) return pendingPromise;
+
     timeoutId = setTimeout(() => {
       const result = fn.apply(this, args);
       pendingResolve(result);
@@ -824,7 +917,7 @@ function debounce(fn, delay) {
       pendingResolve = null;
       timeoutId = null;
     }, delay);
-    
+
     return pendingPromise;
   };
 }
@@ -919,7 +1012,9 @@ async function fetchPrices() {
             }
           }
         }
-      } catch (e) {}
+      } catch (e) {
+        log.warn(`⚠️ Jupiter batch ${Math.floor(i/50)+1} failed:`, e.message);
+      }
       if (i + 50 < mintArray.length) await new Promise(r => setTimeout(r, 100));
     }
     
@@ -1039,7 +1134,7 @@ function getPrice(mint) {
   if (mint === MINTS.USDC || mint === MINTS.USDT) return 1;
   
   const cached = priceCache.get(mint);
-  if (cached && Date.now() - cached.updatedAt < CONFIG.priceRefreshInterval * 3) {
+  if (cached && Date.now() - cached.updatedAt < CONFIG.priceRefreshInterval * 2) {
     return cached.price;
   }
   return null;
@@ -1376,6 +1471,11 @@ function initDatabase() {
         
         -- Wallet alerts
         wallet_alerts INTEGER DEFAULT 1,
+
+        -- New event alerts
+        new_pool_alerts INTEGER DEFAULT 1,
+        lock_alerts INTEGER DEFAULT 1,
+        reward_alerts INTEGER DEFAULT 1,
         
         -- Snooze/quiet
         snoozed_until INTEGER DEFAULT 0,
@@ -1460,10 +1560,28 @@ function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_watchlist_chat_id ON watchlist(chat_id);
       CREATE INDEX IF NOT EXISTS idx_whale_wallets_wallet ON whale_wallets(wallet);
       CREATE INDEX IF NOT EXISTS idx_portfolio_wallets_chat_id ON portfolio_wallets(chat_id);
+
+      -- Seen transactions table (persists dedup across restarts)
+      CREATE TABLE IF NOT EXISTS seen_txs (
+        sig TEXT PRIMARY KEY,
+        added_at INTEGER DEFAULT (strftime('%s', 'now') * 1000)
+      );
     `);
-    
+
+    // Add new columns for existing databases (safe: ALTER TABLE IF NOT EXISTS not supported,
+    // so we catch the "duplicate column" error and ignore it)
+    const newCols = [
+      ['new_pool_alerts', 'INTEGER DEFAULT 1'],
+      ['lock_alerts', 'INTEGER DEFAULT 1'],
+      ['reward_alerts', 'INTEGER DEFAULT 1'],
+    ];
+    for (const [col, type] of newCols) {
+      try { db.exec(`ALTER TABLE users ADD COLUMN ${col} ${type}`); }
+      catch (e) { /* column already exists */ }
+    }
+
     log.info(`✅ Database initialized: ${DB_FILE}`);
-    
+
     // Check if we need to migrate from JSON
     if (fs.existsSync(USERS_FILE) && !hasMigratedFromJson()) {
       migrateFromJson();
@@ -1664,6 +1782,9 @@ function dbRowToUser(row) {
     otherSells: row.other_sells === 1,
     otherThreshold: row.other_threshold,
     walletAlerts: row.wallet_alerts === 1,
+    newPoolAlerts: row.new_pool_alerts === undefined ? true : row.new_pool_alerts === 1,
+    lockAlerts: row.lock_alerts === undefined ? true : row.lock_alerts === 1,
+    rewardAlerts: row.reward_alerts === undefined ? true : row.reward_alerts === 1,
     snoozedUntil: row.snoozed_until,
     quietStart: row.quiet_start,
     quietEnd: row.quiet_end,
@@ -1682,70 +1803,115 @@ function dbRowToUser(row) {
   };
 }
 
-// Save user to database
+// Save user to database (uses upsert to avoid ON DELETE CASCADE, wrapped in transaction)
 function saveUser(user) {
   if (!db || !user) return;
-  
+
   try {
-    const stmt = db.prepare(`
-      INSERT OR REPLACE INTO users (
-        chat_id, onboarded, enabled, blocked,
-        cipher_buys, cipher_sells, cipher_lp_add, cipher_lp_remove, cipher_threshold,
-        track_other_pools, other_lp_add, other_lp_remove, other_lp_threshold,
-        other_buys, other_sells, other_threshold,
-        wallet_alerts, snoozed_until, quiet_start, quiet_end, daily_digest,
-        stats, today_stats, portfolio, my_wallet, created_at, last_active
-      ) VALUES (
-        @chatId, @onboarded, @enabled, @blocked,
-        @cipherBuys, @cipherSells, @cipherLpAdd, @cipherLpRemove, @cipherThreshold,
-        @trackOtherPools, @otherLpAdd, @otherLpRemove, @otherLpThreshold,
-        @otherBuys, @otherSells, @otherThreshold,
-        @walletAlerts, @snoozedUntil, @quietStart, @quietEnd, @dailyDigest,
-        @stats, @todayStats, @portfolio, @myWallet, @createdAt, @lastActive
-      )
-    `);
-    
-    stmt.run({
-      chatId: user.chatId,
-      onboarded: user.onboarded ? 1 : 0,
-      enabled: user.enabled ? 1 : 0,
-      blocked: user.blocked ? 1 : 0,
-      cipherBuys: user.cipherBuys ? 1 : 0,
-      cipherSells: user.cipherSells ? 1 : 0,
-      cipherLpAdd: user.cipherLpAdd ? 1 : 0,
-      cipherLpRemove: user.cipherLpRemove ? 1 : 0,
-      cipherThreshold: user.cipherThreshold || 100,
-      trackOtherPools: user.trackOtherPools ? 1 : 0,
-      otherLpAdd: user.otherLpAdd ? 1 : 0,
-      otherLpRemove: user.otherLpRemove ? 1 : 0,
-      otherLpThreshold: user.otherLpThreshold || 500,
-      otherBuys: user.otherBuys ? 1 : 0,
-      otherSells: user.otherSells ? 1 : 0,
-      otherThreshold: user.otherThreshold || 500,
-      walletAlerts: user.walletAlerts ? 1 : 0,
-      snoozedUntil: user.snoozedUntil || 0,
-      quietStart: user.quietStart,
-      quietEnd: user.quietEnd,
-      dailyDigest: user.dailyDigest ? 1 : 0,
-      stats: JSON.stringify(user.stats || {}),
-      todayStats: JSON.stringify(user.todayStats || {}),
-      portfolio: JSON.stringify(user.portfolio || {}),
-      myWallet: user.myWallet,
-      createdAt: user.createdAt || Date.now(),
-      lastActive: user.lastActive || 0,
-    });
-    
-    // Save portfolio wallets to separate table
-    const portfolioWallets = user.portfolioWallets || [];
-    if (portfolioWallets.length > 0) {
-      // Clear existing and re-insert
-      db.prepare('DELETE FROM portfolio_wallets WHERE chat_id = ?').run(user.chatId);
-      const insertWallet = db.prepare('INSERT INTO portfolio_wallets (chat_id, wallet, is_primary) VALUES (?, ?, ?)');
-      portfolioWallets.forEach((wallet, i) => {
-        insertWallet.run(user.chatId, wallet, i === 0 ? 1 : 0);
+    const saveTransaction = db.transaction(() => {
+      // Upsert user record — ON CONFLICT UPDATE avoids DELETE CASCADE
+      const stmt = db.prepare(`
+        INSERT INTO users (
+          chat_id, onboarded, enabled, blocked,
+          cipher_buys, cipher_sells, cipher_lp_add, cipher_lp_remove, cipher_threshold,
+          track_other_pools, other_lp_add, other_lp_remove, other_lp_threshold,
+          other_buys, other_sells, other_threshold,
+          wallet_alerts, new_pool_alerts, lock_alerts, reward_alerts,
+          snoozed_until, quiet_start, quiet_end, daily_digest,
+          stats, today_stats, portfolio, my_wallet, created_at, last_active
+        ) VALUES (
+          @chatId, @onboarded, @enabled, @blocked,
+          @cipherBuys, @cipherSells, @cipherLpAdd, @cipherLpRemove, @cipherThreshold,
+          @trackOtherPools, @otherLpAdd, @otherLpRemove, @otherLpThreshold,
+          @otherBuys, @otherSells, @otherThreshold,
+          @walletAlerts, @newPoolAlerts, @lockAlerts, @rewardAlerts,
+          @snoozedUntil, @quietStart, @quietEnd, @dailyDigest,
+          @stats, @todayStats, @portfolio, @myWallet, @createdAt, @lastActive
+        )
+        ON CONFLICT(chat_id) DO UPDATE SET
+          onboarded=excluded.onboarded, enabled=excluded.enabled, blocked=excluded.blocked,
+          cipher_buys=excluded.cipher_buys, cipher_sells=excluded.cipher_sells,
+          cipher_lp_add=excluded.cipher_lp_add, cipher_lp_remove=excluded.cipher_lp_remove,
+          cipher_threshold=excluded.cipher_threshold,
+          track_other_pools=excluded.track_other_pools,
+          other_lp_add=excluded.other_lp_add, other_lp_remove=excluded.other_lp_remove,
+          other_lp_threshold=excluded.other_lp_threshold,
+          other_buys=excluded.other_buys, other_sells=excluded.other_sells,
+          other_threshold=excluded.other_threshold,
+          wallet_alerts=excluded.wallet_alerts,
+          new_pool_alerts=excluded.new_pool_alerts, lock_alerts=excluded.lock_alerts,
+          reward_alerts=excluded.reward_alerts,
+          snoozed_until=excluded.snoozed_until,
+          quiet_start=excluded.quiet_start, quiet_end=excluded.quiet_end,
+          daily_digest=excluded.daily_digest,
+          stats=excluded.stats, today_stats=excluded.today_stats,
+          portfolio=excluded.portfolio, my_wallet=excluded.my_wallet,
+          last_active=excluded.last_active
+      `);
+
+      stmt.run({
+        chatId: user.chatId,
+        onboarded: user.onboarded ? 1 : 0,
+        enabled: user.enabled ? 1 : 0,
+        blocked: user.blocked ? 1 : 0,
+        cipherBuys: user.cipherBuys ? 1 : 0,
+        cipherSells: user.cipherSells ? 1 : 0,
+        cipherLpAdd: user.cipherLpAdd ? 1 : 0,
+        cipherLpRemove: user.cipherLpRemove ? 1 : 0,
+        cipherThreshold: user.cipherThreshold || 100,
+        trackOtherPools: user.trackOtherPools ? 1 : 0,
+        otherLpAdd: user.otherLpAdd ? 1 : 0,
+        otherLpRemove: user.otherLpRemove ? 1 : 0,
+        otherLpThreshold: user.otherLpThreshold || 500,
+        otherBuys: user.otherBuys ? 1 : 0,
+        otherSells: user.otherSells ? 1 : 0,
+        otherThreshold: user.otherThreshold || 500,
+        walletAlerts: user.walletAlerts ? 1 : 0,
+        newPoolAlerts: user.newPoolAlerts !== false ? 1 : 0,
+        lockAlerts: user.lockAlerts !== false ? 1 : 0,
+        rewardAlerts: user.rewardAlerts !== false ? 1 : 0,
+        snoozedUntil: user.snoozedUntil || 0,
+        quietStart: user.quietStart,
+        quietEnd: user.quietEnd,
+        dailyDigest: user.dailyDigest ? 1 : 0,
+        stats: JSON.stringify(user.stats || {}),
+        todayStats: JSON.stringify(user.todayStats || {}),
+        portfolio: JSON.stringify(user.portfolio || {}),
+        myWallet: user.myWallet,
+        createdAt: user.createdAt || Date.now(),
+        lastActive: user.lastActive || 0,
       });
-    }
-    
+
+      // Sync portfolio wallets
+      db.prepare('DELETE FROM portfolio_wallets WHERE chat_id = ?').run(user.chatId);
+      const insertPW = db.prepare('INSERT OR IGNORE INTO portfolio_wallets (chat_id, wallet, is_primary) VALUES (?, ?, ?)');
+      (user.portfolioWallets || []).forEach((wallet, i) => {
+        insertPW.run(user.chatId, wallet, i === 0 ? 1 : 0);
+      });
+
+      // Sync watchlist
+      db.prepare('DELETE FROM watchlist WHERE chat_id = ?').run(user.chatId);
+      const insertWL = db.prepare('INSERT OR IGNORE INTO watchlist (chat_id, pool_id) VALUES (?, ?)');
+      for (const poolId of (user.watchlist || [])) {
+        insertWL.run(user.chatId, poolId);
+      }
+
+      // Sync tracked tokens
+      db.prepare('DELETE FROM tracked_tokens WHERE chat_id = ?').run(user.chatId);
+      const insertTT = db.prepare('INSERT OR IGNORE INTO tracked_tokens (chat_id, mint) VALUES (?, ?)');
+      for (const mint of (user.trackedTokens || [])) {
+        insertTT.run(user.chatId, mint);
+      }
+
+      // Sync whale wallets
+      db.prepare('DELETE FROM whale_wallets WHERE chat_id = ?').run(user.chatId);
+      const insertWW = db.prepare('INSERT OR IGNORE INTO whale_wallets (chat_id, wallet) VALUES (?, ?)');
+      for (const wallet of (user.wallets || [])) {
+        insertWW.run(user.chatId, wallet);
+      }
+    });
+
+    saveTransaction();
     log.debug(`💾 Saved user ${user.chatId}`);
   } catch (e) {
     log.error(`❌ Failed to save user ${user.chatId}:`, e.message);
@@ -1759,19 +1925,27 @@ let saveTimeout = null;
 function saveUserDebounced(user) {
   if (!user) return;
   pendingSaves.add(user.chatId);
-  
-  if (saveTimeout) clearTimeout(saveTimeout);
-  
+
+  // Don't reset timer — prevents starvation from rapid saves
+  if (saveTimeout) return;
+
   saveTimeout = setTimeout(() => {
-    const transaction = db.transaction(() => {
-      for (const chatId of pendingSaves) {
-        const u = users.get(chatId);
-        if (u) saveUser(u);
-      }
-    });
-    transaction();
-    log.debug(`💾 Batch saved ${pendingSaves.size} users`);
+    saveTimeout = null;
+    // Snapshot and clear before saving — new saves during transaction start a new timer
+    const batch = new Set(pendingSaves);
     pendingSaves.clear();
+    try {
+      const transaction = db.transaction(() => {
+        for (const chatId of batch) {
+          const u = users.get(chatId);
+          if (u) saveUser(u);
+        }
+      });
+      transaction();
+      log.debug(`💾 Batch saved ${batch.size} users`);
+    } catch (e) {
+      log.error('Failed to batch save users:', e.message);
+    }
   }, CONFIG.saveDebounceMs);
 }
 
@@ -1819,6 +1993,9 @@ function createUser(chatId) {
     trackedTokens: [],
     wallets: [],
     walletAlerts: true,
+    newPoolAlerts: true,
+    lockAlerts: true,
+    rewardAlerts: true,
     snoozedUntil: 0,
     quietStart: null,
     quietEnd: null,
@@ -1929,7 +2106,7 @@ function isQuietHoursActive(user) {
 function getAllTrackedWallets() {
   const wallets = new Set();
   for (const user of users.values()) {
-    if (user.wallets && user.walletAlerts && user.enabled) {
+    if (user.wallets && user.walletAlerts && user.enabled && !user.blocked) {
       user.wallets.forEach(w => wallets.add(w));
     }
   }
@@ -2066,9 +2243,10 @@ async function pollTradesBackup() {
         if (lastSig && sig === lastSig) break; // Reached last processed trade
         
         seenTxs.add(sig);
+        persistSeenTx(sig);
         const usd = estimateTradeUsd(trade, pool);
         const isBuy = trade.side === 'buy';
-        
+
         broadcastTradeAlert({ pool, trade, usd, isBuy, sig });
       }
       
@@ -2099,7 +2277,7 @@ function searchPools(query) {
 
 function isOrbitTransaction(accounts) {
   if (!accounts || !Array.isArray(accounts)) return false;
-  return accounts.some(acc => poolMap.has(acc));
+  return accounts.some(acc => acc === ORBIT_PROGRAM_ID || poolMap.has(acc));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2191,7 +2369,16 @@ function estimateLpUsd(msg, pool) {
   
   if (quotePrice && msg.quoteAmount) {
     const decimals = getDecimals(quote);
-    return (parseFloat(msg.quoteAmount) / Math.pow(10, decimals)) * quotePrice * 2; // *2 for both sides of LP
+    const quoteSide = (parseFloat(msg.quoteAmount) / Math.pow(10, decimals)) * quotePrice;
+    // Add base side if available, otherwise estimate as quote-only (don't blindly 2x for DLMM single-sided deposits)
+    const base = pool.baseMint || pool.base;
+    const basePrice = getPrice(base);
+    if (basePrice && msg.baseAmount) {
+      const baseDecimals = getDecimals(base);
+      const baseSide = (parseFloat(msg.baseAmount) / Math.pow(10, baseDecimals)) * basePrice;
+      return quoteSide + baseSide;
+    }
+    return quoteSide;
   }
   
   return 0;
@@ -2247,6 +2434,7 @@ async function fetchWalletBalances(wallet) {
     let nativeBalance = 0;
     
     // Try Helius SDK first (cleaner, better error handling)
+    let sdkSucceeded = false;
     if (helius) {
       try {
         const response = await helius.rpc.getAssetsByOwner({
@@ -2257,12 +2445,14 @@ async function fetchWalletBalances(wallet) {
         });
         items = response.items || [];
         nativeBalance = response.nativeBalance?.lamports || 0;
+        sdkSucceeded = true;
         log.debug(`Helius SDK: fetched ${items.length} assets for ${wallet.slice(0,8)}`);
       } catch (sdkErr) {
         log.debug('Helius SDK failed, trying HTTP fallback:', sdkErr.message);
-        throw sdkErr; // Fall through to HTTP fallback
+        // Fall through to HTTP fallback below
       }
-    } else {
+    }
+    if (!sdkSucceeded) {
       // HTTP fallback if SDK not initialized
       if (heliusLimiter) await heliusLimiter.acquire();
       const res = await fetchWithRetry(HELIUS.rpc, {
@@ -2512,9 +2702,9 @@ function calculatePnL(trades) {
       pos.cost += trade.usd || 0;
     } else {
       pos.sold += trade.usd || 0;
-      // Simple realized PnL: sell value - proportional cost
-      if (pos.bought > 0) {
-        const proportion = Math.min(trade.usd / pos.bought, 1);
+      // Realized PnL: sell value - proportional cost basis of remaining position
+      if (pos.cost > 0) {
+        const proportion = Math.min(trade.usd / pos.cost, 1);
         const costBasis = pos.cost * proportion;
         realizedPnl += (trade.usd || 0) - costBasis;
         pos.cost -= costBasis;
@@ -2622,8 +2812,15 @@ async function _syncPortfolioInternal(chatId) {
       };
     });
     
-    const results = await Promise.all(walletPromises);
-    
+    const settledResults = await Promise.allSettled(walletPromises);
+    const results = settledResults
+      .filter(r => r.status === 'fulfilled')
+      .map(r => r.value);
+
+    if (results.length === 0 && settledResults.length > 0) {
+      log.warn(`⚠️ All ${settledResults.length} wallet syncs failed`);
+    }
+
     // Aggregate results
     for (const result of results) {
       allTrades.push(...result.trades);
@@ -2791,8 +2988,9 @@ async function fetchStreamflowLockedAmount() {
     const accounts = data.result.value;
     let streamflowLocked = 0;
     
-    // Check each large holder to see if it's a Streamflow escrow
-    for (const account of accounts.slice(0, 20)) {
+    // Check each large holder to see if it's a Streamflow escrow (throttled to avoid rate limits)
+    for (let i = 0; i < Math.min(accounts.length, 20); i++) {
+      const account = accounts[i];
       try {
         const infoRes = await fetchWithRetry(HELIUS.rpc, {
           method: 'POST',
@@ -2804,10 +3002,10 @@ async function fetchStreamflowLockedAmount() {
             params: [account.address, { encoding: 'jsonParsed' }],
           }),
         });
-        
+
         const infoData = await infoRes.json();
         const owner = infoData?.result?.value?.owner;
-        
+
         // Check if owned by Streamflow program or known vesting contract
         if (owner === STREAMFLOW_PROGRAM || owner === MINTS.CIPHER_VESTING) {
           streamflowLocked += parseFloat(account.uiAmountString || account.uiAmount || 0);
@@ -2815,6 +3013,8 @@ async function fetchStreamflowLockedAmount() {
       } catch (e) {
         // Skip this account on error
       }
+      // Throttle: 100ms between calls to avoid burning Helius rate limit
+      if (i < 19) await new Promise(r => setTimeout(r, 100));
     }
     
     return streamflowLocked;
@@ -3541,11 +3741,14 @@ async function fetchOrbitLeaderboard(poolId, limit = 10) {
     const currentPrice = getPrice(pool.baseMint) || 0;
     
     const traders = [...walletStats.values()].map(stats => {
-      // Simple PnL: (sellVolume - buyVolume) + (remaining tokens * current price)
+      // PnL: cost-basis-adjusted realized + unrealized
       const remainingTokens = stats.buyAmount - stats.sellAmount;
-      const unrealizedValue = remainingTokens * currentPrice;
-      const realizedPnl = stats.sellVolume - stats.buyVolume;
-      const totalPnl = realizedPnl + (remainingTokens > 0 ? unrealizedValue - (remainingTokens * (stats.buyVolume / stats.buyAmount || 0)) : 0);
+      const avgCostPerToken = stats.buyAmount > 0 ? stats.buyVolume / stats.buyAmount : 0;
+      const soldCostBasis = stats.sellAmount * avgCostPerToken;
+      const realizedPnl = stats.sellVolume - soldCostBasis;
+      const remainingCostBasis = remainingTokens > 0 ? remainingTokens * avgCostPerToken : 0;
+      const unrealizedValue = remainingTokens > 0 ? remainingTokens * currentPrice : 0;
+      const totalPnl = realizedPnl + (unrealizedValue - remainingCostBasis);
       
       const totalVolume = stats.buyVolume + stats.sellVolume;
       const pnlPercent = totalVolume > 0 ? (totalPnl / stats.buyVolume) * 100 : 0;
@@ -3931,6 +4134,16 @@ function formatLiquidityHistory(poolId) {
 let orbitWs = null;
 let orbitWsRunning = false;
 const seenTxs = new Set();
+let orbitWsReconnectAttempts = 0;
+let orbitWsPingInterval = null;
+let heliusWsReconnectAttempts = 0;
+let heliusWsPingInterval = null;
+
+function getReconnectDelay(attempts) {
+  // Exponential backoff: 15s, 30s, 60s, 120s, max 5 minutes
+  const delay = CONFIG.wsReconnectDelay * Math.pow(2, Math.min(attempts, 5));
+  return Math.min(delay, 5 * 60 * 1000);
+}
 
 async function connectOrbitWs() {
   if (!orbitWsRunning || pools.length === 0) return;
@@ -3946,47 +4159,60 @@ async function connectOrbitWs() {
       } catch (e) {}
       orbitWs = null;
     }
-    
+    if (orbitWsPingInterval) { clearInterval(orbitWsPingInterval); orbitWsPingInterval = null; }
+
     const ticketRes = await fetchWithRetry(ORBIT.wsTicket(), {}, 2);
     const ticketData = await ticketRes.json();
     const ticket = ticketData?.ticket;
-    if (!ticket) { 
+    if (!ticket) {
       log.warn('⚠️ No WS ticket, will retry...');
-      setTimeout(connectOrbitWs, CONFIG.wsReconnectDelay); 
-      return; 
+      setTimeout(connectOrbitWs, getReconnectDelay(orbitWsReconnectAttempts++));
+      return;
     }
-    
+
     const url = CONFIG.orbitApi.replace('https://', 'wss://') + `/ws?ticket=${ticket}`;
     orbitWs = new WebSocket(url);
-    
+
     orbitWs.on('open', () => {
       log.info('✅ Orbit WS connected');
+      orbitWsReconnectAttempts = 0; // Reset backoff on successful connect
       pools.forEach(p => {
         try {
           orbitWs.send(JSON.stringify({ type: 'subscribe', pool: p.id, limit: 10 }));
-        } catch (e) {}
+        } catch (e) {
+          log.debug('Orbit WS subscribe error:', e.message);
+        }
       });
+      // Keepalive ping every 30 seconds to detect zombie connections
+      orbitWsPingInterval = setInterval(() => {
+        if (orbitWs?.readyState === WebSocket.OPEN) {
+          try { orbitWs.ping(); } catch (e) { /* will trigger close */ }
+        }
+      }, 30000);
     });
-    
+
     orbitWs.on('message', (data) => {
-      try { 
-        handleOrbitMessage(JSON.parse(data.toString())); 
+      try {
+        handleOrbitMessage(JSON.parse(data.toString()));
       } catch (e) {
         log.debug('Orbit WS message parse error:', e.message);
       }
     });
-    
+
+    orbitWs.on('pong', () => { /* Connection is alive */ });
+
     orbitWs.on('close', () => {
       log.warn('❌ Orbit WS closed');
-      if (orbitWsRunning) setTimeout(connectOrbitWs, CONFIG.wsReconnectDelay);
+      if (orbitWsPingInterval) { clearInterval(orbitWsPingInterval); orbitWsPingInterval = null; }
+      if (orbitWsRunning) setTimeout(connectOrbitWs, getReconnectDelay(orbitWsReconnectAttempts++));
     });
-    
+
     orbitWs.on('error', (e) => {
       log.error('⚠️ Orbit WS error:', e.message);
     });
   } catch (e) {
     log.error('⚠️ Orbit WS connect failed:', e.message);
-    setTimeout(connectOrbitWs, CONFIG.wsReconnectDelay);
+    setTimeout(connectOrbitWs, getReconnectDelay(orbitWsReconnectAttempts++));
   }
 }
 
@@ -4026,15 +4252,57 @@ function handleOrbitMessage(msg) {
       log.info(`📊 Trade: ${detection.direction || 'unknown'} [${sig?.slice(0,8) || 'no-sig'}...] conf:${detection.confidence}`);
       processTrade({ ...msg, _detectedDirection: detection.direction });
       break;
-      
+
     case TX_TYPE.LP_ADD:
       log.info(`💧 LP Add [${sig?.slice(0,8) || 'no-sig'}...] conf:${detection.confidence}`);
       processLpEvent({ ...msg, _isAdd: true });
       break;
-      
+
     case TX_TYPE.LP_REMOVE:
       log.info(`🔥 LP Remove [${sig?.slice(0,8) || 'no-sig'}...] conf:${detection.confidence}`);
       processLpEvent({ ...msg, _isAdd: false });
+      break;
+
+    case TX_TYPE.CLOSE_POSITION:
+      log.info(`🗑️ Close Position [${sig?.slice(0,8) || 'no-sig'}...] conf:${detection.confidence}`);
+      processLpEvent({ ...msg, _isAdd: false });
+      break;
+
+    case TX_TYPE.POOL_INIT:
+      log.info(`🆕 Pool Initialized [${sig?.slice(0,8) || 'no-sig'}...] conf:${detection.confidence}`);
+      if (sig) { seenTxs.add(sig); persistSeenTx(sig); }
+      // Trigger pool list refresh so new pools appear immediately
+      fetchPools().then(() => {
+        broadcastNewPoolAlert({ poolId, user, sig, timestamp }).catch(e => log.debug('New pool alert failed:', e.message));
+      }).catch(e => log.debug('Pool refresh after init failed:', e.message));
+      break;
+
+    case TX_TYPE.FEES_DISTRIBUTED:
+      log.info(`💸 Fees Distributed [${sig?.slice(0,8) || 'no-sig'}...] conf:${detection.confidence}`);
+      if (sig) { seenTxs.add(sig); persistSeenTx(sig); }
+      break;
+
+    case TX_TYPE.CLAIM_REWARDS:
+      log.info(`🎁 Reward Claim [${sig?.slice(0,8) || 'no-sig'}...] conf:${detection.confidence}`);
+      if (sig) { seenTxs.add(sig); persistSeenTx(sig); }
+      broadcastRewardClaimAlert({ user, sig, poolId, timestamp }).catch(e => log.debug('Reward alert failed:', e.message));
+      break;
+
+    case TX_TYPE.LOCK_LIQUIDITY:
+      log.info(`🔒 Liquidity Locked [${sig?.slice(0,8) || 'no-sig'}...] conf:${detection.confidence}`);
+      if (sig) { seenTxs.add(sig); persistSeenTx(sig); }
+      broadcastLockAlert({ poolId, isLock: true, user, sig, timestamp }).catch(e => log.debug('Lock alert failed:', e.message));
+      break;
+
+    case TX_TYPE.UNLOCK_LIQUIDITY:
+      log.info(`🔓 Liquidity Unlocked [${sig?.slice(0,8) || 'no-sig'}...] conf:${detection.confidence}`);
+      if (sig) { seenTxs.add(sig); persistSeenTx(sig); }
+      broadcastLockAlert({ poolId, isLock: false, user, sig, timestamp }).catch(e => log.debug('Unlock alert failed:', e.message));
+      break;
+
+    case TX_TYPE.SYNC_STAKE:
+      log.info(`🔄 Stake Sync [${sig?.slice(0,8) || 'no-sig'}...] conf:${detection.confidence}`);
+      if (sig) { seenTxs.add(sig); persistSeenTx(sig); }
       break;
   }
 }
@@ -4056,7 +4324,8 @@ function processTrade(msg) {
   
   // Mark as seen IMMEDIATELY before any async operations
   seenTxs.add(sig);
-  
+  persistSeenTx(sig);
+
   if (!poolId) {
     log.warn('⚠️ Trade without poolId, skipping');
     return;
@@ -4102,7 +4371,8 @@ function processLpEvent(msg) {
   
   // Mark as seen IMMEDIATELY
   seenTxs.add(sig);
-  
+  persistSeenTx(sig);
+
   if (!poolId) return;
   
   const pool = poolMap.get(poolId);
@@ -4153,6 +4423,33 @@ function cleanSeenTxs() {
     seenTxs.clear();
     arr.slice(-2500).forEach(s => seenTxs.add(s));
   }
+  // Persist to DB and clean old entries (keep last 24h)
+  if (db) {
+    try {
+      db.prepare('DELETE FROM seen_txs WHERE added_at < ?').run(Date.now() - 24 * 60 * 60 * 1000);
+    } catch (e) {}
+  }
+}
+
+// Load seenTxs from DB on startup to prevent post-restart duplicates
+function loadSeenTxs() {
+  if (!db) return;
+  try {
+    const rows = db.prepare('SELECT sig FROM seen_txs WHERE added_at > ? ORDER BY added_at DESC LIMIT 2500')
+      .all(Date.now() - 24 * 60 * 60 * 1000);
+    rows.forEach(r => seenTxs.add(r.sig));
+    log.info(`✅ Loaded ${rows.length} recent tx signatures from DB`);
+  } catch (e) {
+    log.debug('Failed to load seenTxs:', e.message);
+  }
+}
+
+// Persist a signature to DB
+function persistSeenTx(sig) {
+  if (!db || !sig) return;
+  try {
+    db.prepare('INSERT OR IGNORE INTO seen_txs (sig, added_at) VALUES (?, ?)').run(sig, Date.now());
+  } catch (e) {}
 }
 
 // Clean up stale price cache entries (older than 30 minutes)
@@ -4171,7 +4468,7 @@ function cleanTokenOverviewCache() {
   const maxAge = 60 * 60 * 1000; // 1 hour
   const now = Date.now();
   for (const [mint, data] of tokenOverviewCache.entries()) {
-    if (now - data.timestamp > maxAge) {
+    if (now - (data.fetchedAt || data.timestamp || 0) > maxAge) {
       tokenOverviewCache.delete(mint);
     }
   }
@@ -4207,13 +4504,16 @@ let currentSubscriptions = new Set();
 
 async function connectHeliusWs() {
   if (!heliusWsRunning) return;
-  
+
+  // Clear keepalive from previous connection
+  if (heliusWsPingInterval) { clearInterval(heliusWsPingInterval); heliusWsPingInterval = null; }
+
   const wallets = getAllTrackedWallets();
   if (wallets.length === 0) {
     setTimeout(connectHeliusWs, 30000);
     return;
   }
-  
+
   try {
     // Clean up existing connection before creating new one
     if (heliusWs) {
@@ -4226,11 +4526,20 @@ async function connectHeliusWs() {
       heliusWs = null;
     }
     currentSubscriptions.clear();
-    
+
     heliusWs = new WebSocket(HELIUS.wss);
-    
+
     heliusWs.on('open', () => {
       log.info(`✅ Helius WS connected (${wallets.length} wallets)`);
+      heliusWsReconnectAttempts = 0;
+
+      // Keepalive ping every 30s to detect zombie connections
+      heliusWsPingInterval = setInterval(() => {
+        if (heliusWs?.readyState === WebSocket.OPEN) {
+          try { heliusWs.ping(); } catch (e) { /* will trigger close */ }
+        }
+      }, 30000);
+
       wallets.forEach(wallet => {
         if (!currentSubscriptions.has(wallet)) {
           try {
@@ -4247,41 +4556,89 @@ async function connectHeliusWs() {
         }
       });
     });
-    
+
     heliusWs.on('message', (data) => {
-      try { 
-        handleHeliusMessage(JSON.parse(data.toString())); 
+      try {
+        handleHeliusMessage(JSON.parse(data.toString()));
       } catch (e) {
         log.debug('Helius WS message parse error:', e.message);
       }
     });
-    
+
     heliusWs.on('close', () => {
       log.warn('❌ Helius WS closed');
+      if (heliusWsPingInterval) { clearInterval(heliusWsPingInterval); heliusWsPingInterval = null; }
       currentSubscriptions.clear();
-      if (heliusWsRunning) setTimeout(connectHeliusWs, CONFIG.wsReconnectDelay);
+      if (heliusWsRunning) setTimeout(connectHeliusWs, getReconnectDelay(heliusWsReconnectAttempts++));
     });
-    
+
     heliusWs.on('error', (e) => {
       log.error('⚠️ Helius WS error:', e.message);
     });
   } catch (e) {
     log.error('⚠️ Helius WS connect failed:', e.message);
-    setTimeout(connectHeliusWs, CONFIG.wsReconnectDelay);
+    setTimeout(connectHeliusWs, getReconnectDelay(heliusWsReconnectAttempts++));
   }
 }
 
 function refreshWalletSubscriptions() {
-  if (heliusWs) heliusWs.close();
+  if (!heliusWs || heliusWs.readyState !== WebSocket.OPEN) {
+    // Connection not open — reconnect will pick up the new wallet list
+    if (heliusWsRunning) connectHeliusWs();
+    return;
+  }
+
+  const wallets = new Set(getAllTrackedWallets());
+
+  // Subscribe to new wallets not yet tracked
+  for (const wallet of wallets) {
+    if (!currentSubscriptions.has(wallet)) {
+      try {
+        heliusWs.send(JSON.stringify({
+          jsonrpc: '2.0',
+          id: `sub_${wallet}`,
+          method: 'logsSubscribe',
+          params: [{ mentions: [wallet] }, { commitment: 'confirmed' }]
+        }));
+        currentSubscriptions.add(wallet);
+        log.debug(`Helius WS: subscribed to ${wallet}`);
+      } catch (e) {
+        log.debug('Helius incremental subscribe error:', e.message);
+      }
+    }
+  }
+
+  // Unsubscribe wallets that were removed
+  for (const wallet of currentSubscriptions) {
+    if (!wallets.has(wallet)) {
+      // Note: Solana logsSubscribe doesn't have a clean per-mention unsubscribe,
+      // but removing from tracking set means we'll ignore future messages for it.
+      currentSubscriptions.delete(wallet);
+      log.debug(`Helius WS: untracked ${wallet}`);
+    }
+  }
 }
+
+// Separate dedup set for wallet alerts — prevents cross-source suppression
+// (a tx seen via Orbit WS for trade alerts should still trigger wallet alerts)
+const seenWalletTxs = new Set();
 
 async function handleHeliusMessage(msg) {
   if (msg.result !== undefined) return;
   if (msg.method === 'logsNotification' && msg.params?.result?.value) {
     const { signature } = msg.params.result.value;
-    if (!signature || seenTxs.has(signature)) return;
+    if (!signature || seenWalletTxs.has(signature)) return;
+    seenWalletTxs.add(signature);
+    // Also add to main seenTxs so backup polling doesn't re-process
     seenTxs.add(signature);
+    persistSeenTx(signature);
     await processWalletTransaction(signature);
+    // Clean wallet dedup set periodically
+    if (seenWalletTxs.size > 5000) {
+      const arr = [...seenWalletTxs];
+      seenWalletTxs.clear();
+      arr.slice(-2500).forEach(s => seenWalletTxs.add(s));
+    }
   }
 }
 
@@ -4407,17 +4764,30 @@ async function processWalletTransaction(signature) {
     const walletAddr = tx.feePayer;
     let tokenSymbol = '';
     let isBuy = false;
-    
+
     if (tx.events?.swap) {
+      // Helius Enhanced API path — most reliable
       const swap = tx.events.swap;
       tokenSymbol = getSymbol(swap.tokenOutputs?.[0]?.mint || swap.tokenInputs?.[0]?.mint);
       isBuy = swap.tokenOutputs?.some(t => t.mint === CONFIG.cipherMint);
     } else if (tx.tokenTransfers?.length > 0) {
-      tokenSymbol = getSymbol(tx.tokenTransfers[0].mint);
+      // Backup RPC / Solscan path — infer direction from token transfers
+      const transfers = tx.tokenTransfers;
+      tokenSymbol = getSymbol(transfers[0].mint);
+      // Check if wallet received a known token (buy) or sent it (sell)
+      const received = transfers.find(t => t.toUserAccount === walletAddr || t.destination === walletAddr);
+      const sent = transfers.find(t => t.fromUserAccount === walletAddr || t.source === walletAddr);
+      if (received && received.mint) {
+        tokenSymbol = getSymbol(received.mint);
+        isBuy = true;
+      } else if (sent && sent.mint) {
+        tokenSymbol = getSymbol(sent.mint);
+        isBuy = false;
+      }
     }
     
-    const usdValue = estimateWalletTxUsd(tx);
-    
+    const usdValue = estimateWalletTxUsd(tx) / 2; // Divide by 2: estimateWalletTxUsd sums both sides of a swap
+
     broadcastWalletAlert({ wallet: walletAddr, signature, tokenSymbol, isBuy, usdValue });
   } catch (e) {
     log.error('⚠️ Wallet tx parse failed:', e.message);
@@ -4551,17 +4921,17 @@ const menu = {
       Markup.button.callback('📈 Portfolio', 'nav:portfolio'),
     ]);
     
-    const otherLabel = u?.trackOtherPools !== false ? '🟢 Other Alerts' : '⚫ Other Alerts';
-    let alertLabel = '🔔 Alerts ON';
-    if (!u?.enabled) alertLabel = '⏸️ Paused';
-    else if (snoozed) alertLabel = quietActive ? '🌙 Quiet' : '🔕 Snoozed';
-    
+    const otherLabel = u?.trackOtherPools !== false ? '🟢 Pool Alerts' : '⚫ Pool Alerts';
+    let alertLabel = '🔔 Alert Controls';
+    if (!u?.enabled) alertLabel = '⏸️ Alerts Paused';
+    else if (snoozed) alertLabel = quietActive ? '🌙 Quiet Hours' : '🔕 Snoozed';
+
     btns.push([
       Markup.button.callback(otherLabel, 'nav:othersettings'),
       Markup.button.callback(alertLabel, 'nav:snooze'),
     ]);
     btns.push([
-      Markup.button.callback('📜 History', 'nav:history'),
+      Markup.button.callback('📜 Alert History', 'nav:history'),
       Markup.button.callback('⚙️ Settings', 'nav:settings'),
     ]);
     
@@ -4574,14 +4944,14 @@ const menu = {
     [Markup.button.callback(`${u?.cipherLpAdd ? '✅' : '⬜'} LP Add`, 'tog:cipherLpAdd'),
      Markup.button.callback(`${u?.cipherLpRemove ? '✅' : '⬜'} LP Remove`, 'tog:cipherLpRemove')],
     [Markup.button.callback(`💰 Minimum: ${fmt(u?.cipherThreshold || 100)}`, 'thresh:cipher')],
-    [Markup.button.callback('« Back to Menu', 'nav:main')],
+    [Markup.button.callback('🏠 Menu', 'nav:main')],
   ]),
   
   lp: (u) => Markup.inlineKeyboard([
     [Markup.button.callback(`${u?.otherLpAdd ? '✅' : '⬜'} LP Add Alerts`, 'tog:otherLpAdd'),
      Markup.button.callback(`${u?.otherLpRemove ? '✅' : '⬜'} LP Remove`, 'tog:otherLpRemove')],
     [Markup.button.callback(`💰 Minimum: ${fmt(u?.otherLpThreshold || 500)}`, 'thresh:lp')],
-    [Markup.button.callback('« Back to Menu', 'nav:main')],
+    [Markup.button.callback('🏠 Menu', 'nav:main')],
   ]),
   
   // Pool Explorer menu
@@ -4626,7 +4996,7 @@ const menu = {
       Markup.button.callback('🔍 Search', 'pools:search'),
       Markup.button.callback('⚙️ Alerts', 'nav:othersettings'),
     ]);
-    btns.push([Markup.button.callback('« Back to Menu', 'nav:main')]);
+    btns.push([Markup.button.callback('🏠 Menu', 'nav:main')]);
     
     return Markup.inlineKeyboard(btns);
   },
@@ -4635,7 +5005,13 @@ const menu = {
   trending: () => {
     const topPools = getTopPoolsByVolume(10);
     const btns = [];
-    
+
+    if (topPools.length === 0) {
+      btns.push([Markup.button.callback('📋 All Pools', 'nav:pools')]);
+      btns.push([Markup.button.callback('🏠 Menu', 'nav:main')]);
+      return Markup.inlineKeyboard(btns);
+    }
+
     topPools.forEach((p, i) => {
       const pairName = p.pairName || formatPair(p.baseMint || p.base, p.quoteMint || p.quote);
       const vol = orbitVolumes.pools?.[p.id]?.volume24h || 0;
@@ -4643,13 +5019,13 @@ const menu = {
       const rank = ['🥇', '🥈', '🥉'][i] || `${i + 1}.`;
       btns.push([Markup.button.callback(`${rank} ${icon} ${pairName} • ${fmtCompact(vol)}`, `pool:view:${p.id}`)]);
     });
-    
+
     btns.push([
       Markup.button.callback('🆕 New Pools', 'nav:newpools'),
       Markup.button.callback('📋 All Pools', 'nav:pools'),
     ]);
-    btns.push([Markup.button.callback('« Menu', 'nav:main')]);
-    
+    btns.push([Markup.button.callback('🏠 Menu', 'nav:main')]);
+
     return Markup.inlineKeyboard(btns);
   },
   
@@ -4660,9 +5036,9 @@ const menu = {
     
     const btns = [
       [Markup.button.callback('📊 Chart', `chart:${poolId}:1h`),
-       Markup.button.callback('📜 History', `liqhistory:${poolId}`)],
+       Markup.button.callback('💧 LP History', `liqhistory:${poolId}`)],
       [Markup.button.callback('🏆 Leaderboard', `leaderboard:${pool?.baseMint || pool?.base}`)],
-      [Markup.button.callback(inWatchlist ? '⭐ Remove from Watchlist' : '☆ Add to Watchlist', `pool:watch:${poolId}`)],
+      [Markup.button.callback(inWatchlist ? '❌ Remove from Watchlist' : '☆ Add to Watchlist', `pool:watch:${poolId}`)],
       [Markup.button.callback('🔗 Solscan', 'noop'), Markup.button.callback('🦅 Birdeye', 'noop')],
       [Markup.button.callback('« Back', 'nav:pools'), Markup.button.callback('🏠 Menu', 'nav:main')],
     ];
@@ -4688,16 +5064,14 @@ const menu = {
     [Markup.button.callback(`💰 Trade Min: ${fmt(u?.otherThreshold || 500)}`, 'thresh:other')],
     [Markup.button.callback(`💧 LP Min: ${fmt(u?.otherLpThreshold || 500)}`, 'thresh:lp')],
     [Markup.button.callback('📋 Browse Pools', 'nav:pools')],
-    [Markup.button.callback('« Back to Menu', 'nav:main')],
+    [Markup.button.callback('🏠 Menu', 'nav:main')],
   ]),
   
   wallets: (u) => {
     const btns = [];
     const wallets = u?.wallets || [];
-    
-    if (wallets.length === 0) {
-      btns.push([Markup.button.callback('📭 No wallets yet', 'noop')]);
-    } else {
+
+    if (wallets.length > 0) {
       wallets.slice(0, 5).forEach(w => {
         btns.push([
           Markup.button.callback(`👛 ${shortAddr(w)}`, `view:wallet:${w}`),
@@ -4713,7 +5087,7 @@ const menu = {
     if (wallets.length > 0) {
       btns.push([Markup.button.callback(`${u?.walletAlerts ? '✅' : '⬜'} Wallet Alerts`, 'tog:walletAlerts')]);
     }
-    btns.push([Markup.button.callback('« Back to Menu', 'nav:main')]);
+    btns.push([Markup.button.callback('🏠 Menu', 'nav:main')]);
     return Markup.inlineKeyboard(btns);
   },
   
@@ -4722,7 +5096,7 @@ const menu = {
     
     if (u?.trackOtherPools === false) {
       btns.push([Markup.button.callback('⚠️ Turn on Other Pools first', 'tog:trackOtherPools')]);
-      btns.push([Markup.button.callback('« Back to Menu', 'nav:main')]);
+      btns.push([Markup.button.callback('🏠 Menu', 'nav:main')]);
       return Markup.inlineKeyboard(btns);
     }
     
@@ -4730,9 +5104,7 @@ const menu = {
     const poolCount = u?.watchlist?.length || 0;
     const totalItems = tokenCount + poolCount;
     
-    if (totalItems === 0) {
-      btns.push([Markup.button.callback('📭 Watchlist empty', 'noop')]);
-    } else {
+    if (totalItems > 0) {
       (u?.trackedTokens || []).slice(0, 3).forEach(t => {
         btns.push([
           Markup.button.callback(`🪙 ${getSymbol(t)}`, `view:token:${t}`),
@@ -4762,7 +5134,7 @@ const menu = {
       btns.push([Markup.button.callback('🗑️ Clear All', 'confirm:clearwatchlist')]);
     }
     
-    btns.push([Markup.button.callback('« Back to Menu', 'nav:main')]);
+    btns.push([Markup.button.callback('🏠 Menu', 'nav:main')]);
     return Markup.inlineKeyboard(btns);
   },
   
@@ -4771,34 +5143,29 @@ const menu = {
     const quietActive = isQuietHoursActive(u);
     
     if (u?.snoozedUntil && Date.now() < u.snoozedUntil) {
-      const mins = Math.round((u.snoozedUntil - Date.now()) / 60000);
-      btns.push([Markup.button.callback(`⏰ Snoozed for ${mins} min`, 'noop')]);
       btns.push([Markup.button.callback('🔔 Turn Back On', 'snooze:off')]);
     } else {
-      btns.push([Markup.button.callback('⏰ Snooze Alerts', 'noop')]);
       btns.push([
-        Markup.button.callback('1 hour', 'snooze:60'),
-        Markup.button.callback('4 hours', 'snooze:240'),
-        Markup.button.callback('8 hours', 'snooze:480'),
+        Markup.button.callback('🕐 1 hour', 'snooze:60'),
+        Markup.button.callback('🕓 4 hours', 'snooze:240'),
+        Markup.button.callback('🕗 8 hours', 'snooze:480'),
       ]);
     }
     
     btns.push([Markup.button.callback(`🌙 Quiet Hours${quietActive ? ' (Active)' : ''}`, 'nav:quiet')]);
-    btns.push([Markup.button.callback('« Back to Menu', 'nav:main')]);
+    btns.push([Markup.button.callback('🏠 Menu', 'nav:main')]);
     return Markup.inlineKeyboard(btns);
   },
   
   quiet: (u) => {
     const hasQuiet = u?.quietStart !== null && u?.quietEnd !== null;
-    const quietActive = isQuietHoursActive(u);
-    
+
     return Markup.inlineKeyboard([
-      [Markup.button.callback(hasQuiet ? `🌙 ${u.quietStart}:00-${u.quietEnd}:00 UTC${quietActive ? ' ✓' : ''}` : '🌙 Not configured', 'noop')],
-      [Markup.button.callback('Set 10pm-6am', 'quiet:22:6')],
-      [Markup.button.callback('Set 11pm-7am', 'quiet:23:7')],
-      [Markup.button.callback('Set 12am-8am', 'quiet:0:8')],
+      [Markup.button.callback('Set 22:00-06:00 UTC', 'quiet:22:6')],
+      [Markup.button.callback('Set 23:00-07:00 UTC', 'quiet:23:7')],
+      [Markup.button.callback('Set 00:00-08:00 UTC', 'quiet:0:8')],
       [Markup.button.callback(hasQuiet ? '🔔 Turn Off Quiet Hours' : '« Back', hasQuiet ? 'quiet:off' : 'nav:snooze')],
-      [Markup.button.callback('« Back to Menu', 'nav:main')],
+      [Markup.button.callback('🏠 Menu', 'nav:main')],
     ]);
   },
   
@@ -4806,35 +5173,40 @@ const menu = {
     const btns = [];
     const alerts = u?.recentAlerts || [];
     
-    if (alerts.length === 0) {
-      btns.push([Markup.button.callback('📭 No recent alerts', 'noop')]);
-      btns.push([Markup.button.callback('💡 Alerts will appear here', 'noop')]);
-    } else {
+    if (alerts.length > 0) {
       alerts.slice(0, 5).forEach((a) => {
         let icon = '💧';
         if (a.type === 'trade') icon = a.isBuy ? '🟢' : '🔴';
         else if (a.type === 'wallet') icon = '🐋';
         else if (a.type === 'lp') icon = a.isAdd ? '💧' : '🔥';
-        const time = new Date(a.time).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+        else if (a.type === 'pool_init') icon = '🆕';
+        else if (a.type === 'lock') icon = '🔒';
+        else if (a.type === 'unlock') icon = '🔓';
+        else if (a.type === 'reward') icon = '🎁';
+        const time = new Date(a.time).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC' });
         const label = a.pair || a.token || a.wallet || '???';
         if (a.sig) {
           btns.push([Markup.button.url(`${icon} ${label} ${fmt(a.usd)} • ${time}`, `https://solscan.io/tx/${a.sig}`)]);
         } else {
-          btns.push([Markup.button.callback(`${icon} ${label} ${fmt(a.usd)} • ${time}`, 'noop')]);
+          btns.push([Markup.button.callback(`${icon} ${label} ${fmt(a.usd)} • ${time}`, 'noop_alert')]);
         }
       });
     }
     
-    btns.push([Markup.button.callback('« Back to Menu', 'nav:main')]);
+    btns.push([Markup.button.callback('🏠 Menu', 'nav:main')]);
     return Markup.inlineKeyboard(btns);
   },
   
   settings: (u) => Markup.inlineKeyboard([
     [Markup.button.callback(u?.enabled ? '⏸️ Pause All Alerts' : '▶️ Resume Alerts', 'tog:enabled')],
-    [Markup.button.callback(u?.dailyDigest ? '📬 Daily Digest: ON' : '📭 Daily Digest: OFF', 'tog:dailyDigest')],
-    [Markup.button.callback('🗑️ Reset Statistics', 'confirm:resetstats')],
-    [Markup.button.callback('❓ Help & Support', 'info:help')],
-    [Markup.button.callback('« Back to Menu', 'nav:main')],
+    [Markup.button.callback('🔷 CIPHER Settings', 'nav:cipher'), Markup.button.callback('🌐 Pool Settings', 'nav:othersettings')],
+    [Markup.button.callback('💧 LP Settings', 'nav:lp'), Markup.button.callback('👛 Wallets', 'nav:wallets')],
+    [Markup.button.callback(u?.newPoolAlerts !== false ? '🆕 New Pools: ON' : '🆕 New Pools: OFF', 'tog:newPoolAlerts'),
+     Markup.button.callback(u?.lockAlerts !== false ? '🔒 Lock: ON' : '🔒 Lock: OFF', 'tog:lockAlerts')],
+    [Markup.button.callback(u?.rewardAlerts !== false ? '🎁 Rewards: ON' : '🎁 Rewards: OFF', 'tog:rewardAlerts'),
+     Markup.button.callback(u?.dailyDigest ? '📬 Digest: ON' : '📭 Digest: OFF', 'tog:dailyDigest')],
+    [Markup.button.callback('🗑️ Reset Statistics', 'confirm:resetstats'), Markup.button.callback('❓ Help', 'info:help')],
+    [Markup.button.callback('🏠 Menu', 'nav:main')],
   ]),
   
   threshold: (type, current) => {
@@ -4912,7 +5284,7 @@ const menu = {
   
   alertActions: (poolId, sig) => Markup.inlineKeyboard([
     [Markup.button.url('🔍 View on Solscan', `https://solscan.io/tx/${sig}`)],
-    [Markup.button.callback('➕ Add to Watchlist', `add:pool:${poolId}:alert`), Markup.button.callback('🔕 Snooze', 'snooze:alert:60')],
+    [Markup.button.callback('➕ Add to Watchlist', `add:pool:${poolId}:alert`), Markup.button.callback('🔕 Snooze 1h', 'snooze:alert:60')],
   ]),
   
   walletAlertActions: (sig) => Markup.inlineKeyboard([
@@ -4953,10 +5325,10 @@ const menu = {
       btns.push([Markup.button.callback('➕ Add Wallet', 'portfolio:addwallet')]);
     }
     
-    btns.push([Markup.button.callback('« Back', 'nav:main')]);
+    btns.push([Markup.button.callback('🏠 Menu', 'nav:main')]);
     return Markup.inlineKeyboard(btns);
   },
-  
+
   // Portfolio wallet management menu
   portfolioWallets: (u) => {
     const walletList = u?.portfolioWallets || [];
@@ -4965,15 +5337,13 @@ const menu = {
     }
     const btns = [];
     
-    if (walletList.length === 0) {
-      btns.push([Markup.button.callback('📭 No wallets added', 'noop')]);
-    } else {
+    if (walletList.length > 0) {
       walletList.slice(0, 5).forEach((w, i) => {
-        const shortAddr = w.slice(0, 4) + '...' + w.slice(-4);
+        const addr = w.slice(0, 4) + '...' + w.slice(-4);
         const p = u?.portfolio?.walletData?.[w] || {};
         const value = p.value ? ` • ${fmt(p.value)}` : '';
         btns.push([
-          Markup.button.callback(`${i === 0 ? '⭐' : '👛'} ${shortAddr}${value}`, `portfolio:view:${w}`),
+          Markup.button.callback(`${i === 0 ? '⭐' : '👛'} ${addr}${value}`, `portfolio:view:${w}`),
           Markup.button.callback('🗑️', `portfolio:rmwallet:${w}`),
         ]);
       });
@@ -4987,14 +5357,19 @@ const menu = {
     return Markup.inlineKeyboard(btns);
   },
   
-  portfolioLp: (positions) => {
+  portfolioLp: (positions, page = 0) => {
     if (!positions || positions.length === 0) {
       return Markup.inlineKeyboard([
+        [Markup.button.callback('➕ Add Wallet', 'portfolio:addwallet')],
         [Markup.button.callback('« Back', 'nav:portfolio'), Markup.button.callback('🏠 Menu', 'nav:main')]
       ]);
     }
-    const btns = positions.slice(0, 8).map(pos => {
-      const walletShort = pos.wallet ? ` (${pos.wallet.slice(0, 4)}...)` : '';
+    const pageSize = 8;
+    const start = page * pageSize;
+    const pagePositions = positions.slice(start, start + pageSize);
+    const totalPages = Math.ceil(positions.length / pageSize);
+
+    const btns = pagePositions.map(pos => {
       return [
         Markup.button.callback(
           `${pos.isCipher ? '🔷' : '💧'} ${pos.pool} • ${fmt(pos.valueUsd)}`,
@@ -5002,6 +5377,14 @@ const menu = {
         )
       ];
     });
+
+    if (totalPages > 1) {
+      const navBtns = [];
+      if (page > 0) navBtns.push(Markup.button.callback('«', `portfolio:lp:${page - 1}`));
+      navBtns.push(Markup.button.callback(`${page + 1}/${totalPages}`, 'noop'));
+      if (page < totalPages - 1) navBtns.push(Markup.button.callback('»', `portfolio:lp:${page + 1}`));
+      btns.push(navBtns);
+    }
     btns.push([Markup.button.callback('🔄 Refresh', 'portfolio:sync'), Markup.button.callback('« Back', 'nav:portfolio')]);
     btns.push([Markup.button.callback('🏠 Menu', 'nav:main')]);
     return Markup.inlineKeyboard(btns);
@@ -5042,7 +5425,7 @@ const menu = {
 // TEXTS
 // ═══════════════════════════════════════════════════════════════════════════════
 const text = {
-  welcome: () => `🚀 *Orbit Tracker*
+  welcome: (name) => `🚀 *Orbit Tracker*${name ? `\n\nWelcome, ${name}!` : ''}
 
 Your complete Orbit Finance companion.
 
@@ -5054,21 +5437,21 @@ Your complete Orbit Finance companion.
 • 📊 Charts & leaderboards
 • ⭐ Custom watchlists`,
 
-  dashboard: (u) => {
+  dashboard: (u, name) => {
     const today = u?.todayStats || { trades: 0, lp: 0, wallet: 0 };
     const watchCount = (u?.watchlist?.length || 0) + (u?.trackedTokens?.length || 0);
     const walletCount = u?.wallets?.length || 0;
     const snoozed = isUserSnoozed(u);
     const quietActive = isQuietHoursActive(u);
-    
+
     let status = '🟢 Active';
     if (!u?.enabled) status = '⏸️ Paused';
     else if (snoozed) status = quietActive ? '🌙 Quiet Hours' : '🔕 Snoozed';
-    
+
     const solPrice = getPrice(MINTS.SOL);
-    const priceDisplay = solPrice ? `$${solPrice.toFixed(0)}` : 'Loading...';
+    const priceDisplay = solPrice ? `$${solPrice.toFixed(2)}` : 'Loading...';
     const vol24h = orbitVolumes.total24h ? fmt(orbitVolumes.total24h) : '-';
-    
+
     // Enhanced portfolio summary
     const hasPortfolio = !!u?.myWallet;
     let portfolioLine = '';
@@ -5077,10 +5460,12 @@ Your complete Orbit Finance companion.
       const netWorth = p.totalValue || 0;
       const pnl = p.realizedPnl || 0;
       const pnlIcon = pnl >= 0 ? '🟢' : '🔴';
-      portfolioLine = `\n📈 Portfolio: ${fmt(netWorth)} • ${pnlIcon} ${pnl >= 0 ? '+' : ''}${fmt(Math.abs(pnl))} PnL`;
+      portfolioLine = `\n📈 Portfolio: ${fmt(netWorth)} • ${pnlIcon} ${pnl >= 0 ? '+' : '-'}${fmt(Math.abs(pnl))} PnL`;
     }
-    
-    return `📊 *Dashboard*
+
+    const greeting = name ? `\nWelcome back, ${name}!` : '';
+
+    return `📊 *Dashboard*${greeting}
 
 *Status:* ${status}
 
@@ -5090,7 +5475,7 @@ Your complete Orbit Finance companion.
 ⭐ ${watchCount} watchlist item${watchCount !== 1 ? 's' : ''}${portfolioLine}
 
 *Today:* ${today.trades} trades, ${today.lp} LP, ${today.wallet} wallet
-*Your volume:* ${fmt(u?.stats?.volume || 0)}
+*Tracked volume:* ${fmt(u?.stats?.volume || 0)}
 
 _SOL: ${priceDisplay} • Orbit 24h: ${vol24h}_`;
   },
@@ -5115,22 +5500,35 @@ _No wallet connection required. Read-only. Safe._`,
 
   help: () => `📚 *Orbit Tracker Help*
 
-*Portfolio Commands:*
+*Portfolio:*
 /portfolio — View your portfolio
 /pnl — Quick PnL summary
 /lp — View LP positions
 /refresh — Sync portfolio data
 /wallets — Manage tracked wallets
 
+*Pool Explorer:*
+/pools — Browse all pools
+/trending — Top pools by volume
+/newpools — Recently added pools
+
 *Market Info:*
 /price — SOL & CIPHER prices
 /cipher — CIPHER token stats
-/status — Bot & API status
+/chart — Price chart (try /chart CIPHER 1h)
+/leaderboard — Top traders PnL
+/liquidity — LP event history
 
-*Alert Controls:*
+*Alerts:*
 /pause — Pause all alerts
 /resume — Resume alerts
 /snooze — Snooze for 1 hour
+
+*Settings:*
+/settings — Alert preferences
+/stats — Your usage stats
+/status — Bot & API status
+/menu — Open main menu
 
 *Tips:*
 • Track up to 5 wallets in portfolio
@@ -5210,6 +5608,12 @@ _Sorted by ${sortBy === 'volume' ? '24h Volume' : sortBy === 'tvl' ? 'TVL' : 'Tr
   
   trending: () => {
     const totalVol = orbitVolumes.total24h || 0;
+    const topPools = getTopPoolsByVolume(10);
+    if (topPools.length === 0) {
+      return `🔥 *Trending Pools*
+
+No trading activity recorded yet. Check back soon!`;
+    }
     return `🔥 *Trending Pools*
 
 Top pools by 24h trading volume.
@@ -5227,22 +5631,38 @@ _Tap a pool for details, charts, and leaderboards._`;
     const trades24h = orbitVolumes.pools?.[pool.id]?.trades24h || 0;
     const tvl = pool.tvl || pool.liquidity || 0;
     const fee = pool.fee || pool.feeRate || 0;
+    const baseFee = pool.baseFee || pool.base_fee || 0;
+    const maxFee = pool.maxFee || pool.max_fee || 0;
+    const protocolFee = pool.protocolFee || pool.protocol_fee || 0;
     const icon = pool.isCipher ? '🔷' : '🌐';
-    
+
     // Get base token price
     const baseMint = pool.baseMint || pool.base;
     const basePrice = getPrice(baseMint) || 0;
     const priceStr = basePrice > 0 ? `$${basePrice < 0.01 ? basePrice.toFixed(6) : basePrice.toFixed(4)}` : 'N/A';
-    
+
+    // Build fee display - show breakdown if available
+    let feeStr = 'N/A';
+    if (fee > 0) {
+      feeStr = `${(fee * 100).toFixed(2)}%`;
+    }
+    if (baseFee > 0 || maxFee > 0) {
+      const parts = [];
+      if (baseFee > 0) parts.push(`Base ${(baseFee * 100).toFixed(2)}%`);
+      if (maxFee > 0) parts.push(`Max ${(maxFee * 100).toFixed(2)}%`);
+      if (protocolFee > 0) parts.push(`Protocol ${(protocolFee * 100).toFixed(2)}%`);
+      if (parts.length > 0) feeStr += ` (${parts.join(' · ')})`;
+    }
+
     return `${icon} *${pairName}*
 
 💵 *Price:* ${priceStr}
 📊 *24h Volume:* ${fmtCompact(vol24h)}
 🔄 *24h Trades:* ${trades24h}
 💰 *TVL:* ${fmtCompact(tvl)}
-💸 *Fee:* ${(fee * 100).toFixed(2)}%
+💸 *Fee:* ${feeStr}
 
-\`${pool.id?.slice(0, 20)}...\``;
+\`${pool.id}\``;
   },
   
   otherPoolSettings: (u) => {
@@ -5270,18 +5690,34 @@ _Configure alerts for all non-CIPHER pools on Orbit._`;
 
 🌙 *Quiet hours active* — alerts paused until ${u.quietEnd}:00 UTC`;
     }
+    if (u?.snoozedUntil && Date.now() < u.snoozedUntil) {
+      const mins = Math.round((u.snoozedUntil - Date.now()) / 60000);
+      return `🔕 *Alert Controls*
+
+⏰ *Snoozed* — alerts paused for ${mins} more minute${mins !== 1 ? 's' : ''}`;
+    }
     return `🔕 *Alert Controls*
 
 Temporarily pause alerts or set up quiet hours.`;
   },
   
-  quiet: () => `🌙 *Quiet Hours*
+  quiet: (u) => {
+    const hasQuiet = u?.quietStart !== null && u?.quietEnd !== null;
+    const current = hasQuiet ? `\n\n*Current:* ${u.quietStart}:00 — ${u.quietEnd}:00 UTC` : '';
+    return `🌙 *Quiet Hours*
 
-Set hours when you don't want to receive alerts (times in UTC).`,
+Set hours when you don't want to receive alerts (all times in UTC).${current}`;
+  },
   
-  history: () => `📜 *Recent Alerts*
+  history: (u) => {
+    const count = u?.recentAlerts?.length || 0;
+    if (count === 0) return `📜 *Recent Alerts*
 
-Your last ${CONFIG.maxRecentAlerts} alerts. Tap to view on Solscan.`,
+No alerts yet. They'll appear here as you receive them.`;
+    return `📜 *Recent Alerts*
+
+Your last ${count} alert${count !== 1 ? 's' : ''}. Tap to view on Solscan.`;
+  },
   
   settings: (u) => {
     const alertStatus = u?.enabled ? (isUserSnoozed(u) ? '🔕 Snoozed' : '🔔 Active') : '⏸️ Paused';
@@ -5300,6 +5736,9 @@ Your last ${CONFIG.maxRecentAlerts} alerts. Tap to view on Solscan.`,
 *Min Amount:* ${fmt(u?.cipherThreshold || 100)}
 *Other Pools:* ${u?.trackOtherPools !== false ? 'ON' : 'OFF'}
 *Wallet Alerts:* ${u?.walletAlerts ? 'ON' : 'OFF'}
+*New Pools:* ${u?.newPoolAlerts !== false ? '🆕 ON' : 'OFF'}
+*Lock/Unlock:* ${u?.lockAlerts !== false ? '🔒 ON' : 'OFF'}
+*Rewards:* ${u?.rewardAlerts !== false ? '🎁 ON' : 'OFF'}
 
 *Tracked:*
 • ${u?.wallets?.length || 0} whale wallets
@@ -5389,7 +5828,7 @@ _Add up to 5 wallets_`;
     }
     
     const p = u.portfolio || {};
-    const lastSync = p.lastSync ? new Date(p.lastSync).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }) : 'Never';
+    const lastSync = p.lastSync ? new Date(p.lastSync).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC' }) : 'Never';
     
     // Balances - ensure we have numbers
     const solBalance = parseFloat(p.solBalance) || 0;
@@ -5410,8 +5849,8 @@ _Add up to 5 wallets_`;
     // PnL display - ensure we have numbers
     const realizedPnl = parseFloat(p.realizedPnl) || 0;
     const pnlIcon = realizedPnl >= 0 ? '🟢' : '🔴';
-    const pnlSign = realizedPnl >= 0 ? '+' : '';
-    
+    const pnlSign = realizedPnl >= 0 ? '+' : '-';
+
     // Build holdings breakdown - only show if > 0
     let holdingsText = '';
     if (solBalance > 0) {
@@ -5534,17 +5973,17 @@ ${stakedSection}${topTokensText}
 *Trading Performance:*
 📈 Volume: ${fmt(totalVolume)}
 🔄 Trades: ${tradeCount} (🟢 ${buyCount} / 🔴 ${sellCount})
-${pnlIcon} Realized: ${realizedPnl >= 0 ? '+' : ''}${fmt(Math.abs(realizedPnl))} (${pnlPercent}%)
-${unrealizedPnl !== 0 ? `📉 Unrealized: ${unrealizedPnl >= 0 ? '+' : ''}${fmt(Math.abs(unrealizedPnl))}\n` : ''}${walletBreakdown}`;
+${pnlIcon} Realized: ${realizedPnl >= 0 ? '+' : '-'}${fmt(Math.abs(realizedPnl))} (${pnlPercent}%)
+${unrealizedPnl !== 0 ? `📉 Unrealized: ${unrealizedPnl >= 0 ? '+' : '-'}${fmt(Math.abs(unrealizedPnl))}\n` : ''}${walletBreakdown}`;
   },
   
   portfolioTokens: (tokens, totalValue) => {
     if (!tokens || tokens.length === 0) {
       return `🪙 *Token Holdings*
 
-No tokens found.
+No token balances found.
 
-_Add wallets to track holdings_`;
+_Tap Refresh to sync, or check /status for API health._`;
     }
     
     let list = '';
@@ -5587,7 +6026,7 @@ ${list}`;
 
 No LP positions found.
 
-_Add wallets to track LP positions_`;
+_Tap Refresh to sync your data._`;
     }
     
     const total = positions.reduce((sum, p) => sum + (p.valueUsd || 0), 0);
@@ -5604,9 +6043,9 @@ _Add wallets to track LP positions_`;
     if (!trades || trades.length === 0) {
       return `📜 *Trade History*
 
-No Orbit trades found.
+No Orbit trades found yet.
 
-_Add wallets to track trades_`;
+_Tap Refresh to sync, or check back after your wallets have traded on Orbit._`;
     }
     
     const buys = trades.filter(t => t.side === 'buy');
@@ -5639,13 +6078,14 @@ Paste a Solana wallet address:`,
 bot.command('start', async (ctx) => {
   try {
     let user = getUser(ctx.chat.id) || createUser(ctx.chat.id);
+    const name = ctx.from?.first_name || '';
     if (!user.onboarded) {
-      await ctx.reply(text.welcome(), { parse_mode: 'Markdown', ...menu.welcome() });
+      await ctx.reply(text.welcome(name), { parse_mode: 'Markdown', ...menu.welcome() });
     } else {
-      await ctx.reply(text.dashboard(user), { parse_mode: 'Markdown', ...menu.main(user) });
+      await ctx.reply(text.dashboard(user, name), { parse_mode: 'Markdown', ...menu.main(user) });
     }
   } catch (e) {
-    try { await ctx.reply('Welcome! Tap Get Started.', menu.welcome()); } catch (e2) {}
+    try { await ctx.reply('🚀 Welcome to Orbit Tracker! Tap Get Started.', { ...menu.welcome() }); } catch (e2) {}
   }
 });
 
@@ -5653,25 +6093,33 @@ bot.command('menu', async (ctx) => {
   try {
     const user = getUser(ctx.chat.id) || createUser(ctx.chat.id);
     await ctx.reply(text.dashboard(user), { parse_mode: 'Markdown', ...menu.main(user) });
-  } catch (e) {}
+  } catch (e) {
+    try { await ctx.reply('❌ Something went wrong.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) }); } catch (e2) {}
+  }
 });
 
 bot.command('status', async (ctx) => {
-  try { await ctx.reply(text.status(), { parse_mode: 'Markdown' }); } catch (e) {}
+  try { await ctx.reply(text.status(), { parse_mode: 'Markdown' }); } catch (e) {
+    try { await ctx.reply('❌ Failed to load status.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) }); } catch (e2) {}
+  }
 });
 
 bot.command('pause', async (ctx) => {
   try {
     updateUser(ctx.chat.id, { enabled: false });
     await ctx.reply('⏸️ Alerts paused. Use /resume to turn back on.');
-  } catch (e) {}
+  } catch (e) {
+    try { await ctx.reply('❌ Failed to pause alerts.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) }); } catch (e2) {}
+  }
 });
 
 bot.command('resume', async (ctx) => {
   try {
     updateUser(ctx.chat.id, { enabled: true, snoozedUntil: 0 });
     await ctx.reply('▶️ Alerts resumed!');
-  } catch (e) {}
+  } catch (e) {
+    try { await ctx.reply('❌ Failed to resume alerts.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) }); } catch (e2) {}
+  }
 });
 
 bot.command('snooze', async (ctx) => {
@@ -5681,7 +6129,9 @@ bot.command('snooze', async (ctx) => {
       updateUser(ctx.chat.id, { snoozedUntil: Date.now() + 3600000 });
       await ctx.reply('🔕 Snoozed for 1 hour. Use /resume to turn back on.');
     }
-  } catch (e) {}
+  } catch (e) {
+    try { await ctx.reply('❌ Failed to snooze.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) }); } catch (e2) {}
+  }
 });
 
 bot.command('cipher', async (ctx) => {
@@ -5751,7 +6201,7 @@ bot.command('cipher', async (ctx) => {
     });
   } catch (e) {
     log.error('CIPHER command error:', e);
-    await ctx.reply('❌ Failed to load CIPHER data. Try again.');
+    await ctx.reply('❌ Failed to load CIPHER data.', { ...Markup.inlineKeyboard([[Markup.button.callback('🔷 CIPHER Settings', 'nav:cipher'), Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
@@ -5769,16 +6219,16 @@ bot.command('price', async (ctx) => {
 ◎ *SOL:* $${solPrice ? solPrice.toFixed(2) : 'N/A'}
 🔷 *CIPHER:* ${cipherPrice ? fmtPrice(cipherPrice) : 'N/A'} ${cipherChangeIcon} ${cipherChange >= 0 ? '+' : ''}${cipherChange.toFixed(2)}%
 
-_Source: ${priceApiStatus}_`;
+_Source: ${priceApiStatus === 'jupiter' ? 'Jupiter' : priceApiStatus === 'dexscreener' ? 'DexScreener' : priceApiStatus === 'birdeye' ? 'Birdeye' : priceApiStatus === 'coingecko' ? 'CoinGecko' : priceApiStatus}_`;
 
-    await ctx.reply(msg, { 
+    await ctx.reply(msg, {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
         [Markup.button.callback('🔄 Refresh', 'cmd:refreshprice')],
       ])
     });
   } catch (e) {
-    await ctx.reply('❌ Failed to load prices.');
+    await ctx.reply('❌ Failed to load prices.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
@@ -5791,55 +6241,24 @@ bot.command('portfolio', async (ctx) => {
     const user = getUser(ctx.chat.id) || createUser(ctx.chat.id);
     await ctx.reply(text.portfolio(user), { parse_mode: 'Markdown', ...menu.portfolio(user) });
   } catch (e) {
-    await ctx.reply('❌ Failed to load portfolio.');
+    await ctx.reply('❌ Failed to load portfolio.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
 bot.command('help', async (ctx) => {
   try {
-    const helpMsg = `📚 *Orbit Tracker Commands*
-
-*Portfolio:*
-/portfolio — View your portfolio
-/pnl — Quick PnL summary
-/lp — View LP positions
-/refresh — Sync portfolio data
-/wallets — Manage tracked wallets
-
-*Pool Explorer:*
-/pools — Browse all pools
-/trending — Top pools by volume
-/newpools — Recently added pools
-
-*Market Info:*
-/price — SOL & CIPHER prices
-/cipher — CIPHER token stats
-/chart — Price chart (try /chart CIPHER 1h)
-/leaderboard — Top traders PnL
-/liquidity — LP event history
-
-*Alerts:*
-/pause — Pause all alerts
-/resume — Resume alerts
-/snooze — Snooze for 1 hour
-
-*Settings:*
-/settings — Alert preferences
-/stats — Your usage stats
-/status — Bot & API status
-/menu — Open main menu
-
-_Tip: Use the menu buttons for full features!_`;
-
-    await ctx.reply(helpMsg, { 
+    await ctx.reply(text.help(), {
       parse_mode: 'Markdown',
+      disable_web_page_preview: true,
       ...Markup.inlineKeyboard([
         [Markup.button.callback('🌐 Pools', 'nav:pools'), Markup.button.callback('🔥 Trending', 'nav:trending')],
         [Markup.button.callback('📈 Portfolio', 'nav:portfolio'), Markup.button.callback('⚙️ Settings', 'nav:settings')],
         [Markup.button.callback('🏠 Menu', 'nav:main')],
       ])
     });
-  } catch (e) {}
+  } catch (e) {
+    try { await ctx.reply('❌ Failed to load help. Try /start'); } catch (e2) {}
+  }
 });
 
 bot.command('lp', async (ctx) => {
@@ -5849,16 +6268,16 @@ bot.command('lp', async (ctx) => {
     const hasWallets = walletList.length > 0 || !!user?.myWallet;
     
     if (!hasWallets) {
-      await ctx.reply('📈 Add a wallet first to view LP positions.', {
+      await ctx.reply('💧 Add a wallet first to view LP positions.', {
         ...Markup.inlineKeyboard([[Markup.button.callback('➕ Add Wallet', 'portfolio:addwallet')]])
       });
       return;
     }
-    
+
     const positions = user.portfolio?.lpPositions || [];
     await ctx.reply(text.portfolioLp(positions), { parse_mode: 'Markdown', ...menu.portfolioLp(positions) });
   } catch (e) {
-    await ctx.reply('❌ Failed to load LP positions.');
+    await ctx.reply('❌ Failed to load LP positions.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
@@ -5869,7 +6288,7 @@ bot.command('pnl', async (ctx) => {
     const hasWallets = walletList.length > 0 || !!user?.myWallet;
     
     if (!hasWallets) {
-      await ctx.reply('📈 Add a wallet first to view PnL.', {
+      await ctx.reply('📊 Add a wallet first to view PnL.', {
         ...Markup.inlineKeyboard([[Markup.button.callback('➕ Add Wallet', 'portfolio:addwallet')]])
       });
       return;
@@ -5890,15 +6309,15 @@ bot.command('pnl', async (ctx) => {
 
 *${walletCount} wallet${walletCount !== 1 ? 's' : ''} tracked*
 
-${realIcon} *Realized:* ${realizedPnl >= 0 ? '+' : ''}${fmt(Math.abs(realizedPnl))} (${pnlPercent}%)
-${unrealIcon} *Unrealized:* ${unrealizedPnl >= 0 ? '+' : ''}${fmt(Math.abs(unrealizedPnl))}
+${realIcon} *Realized:* ${realizedPnl >= 0 ? '+' : '-'}${fmt(Math.abs(realizedPnl))} (${pnlPercent}%)
+${unrealIcon} *Unrealized:* ${unrealizedPnl >= 0 ? '+' : '-'}${fmt(Math.abs(unrealizedPnl))}
 
-💎 *Total:* ${totalPnl >= 0 ? '+' : ''}${fmt(Math.abs(totalPnl))}
+💎 *Total:* ${totalPnl >= 0 ? '+' : '-'}${fmt(Math.abs(totalPnl))}
 
 📈 Volume: ${fmt(p.totalVolume || 0)}
 🔄 Trades: ${p.tradeCount || 0} (🟢 ${p.buyCount || 0} / 🔴 ${p.sellCount || 0})
 
-_Last sync: ${p.lastSync ? new Date(p.lastSync).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }) : 'Never'} UTC_`;
+_Last sync: ${p.lastSync ? new Date(p.lastSync).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC' }) : 'Never'} UTC_`;
 
     await ctx.reply(msg, { 
       parse_mode: 'Markdown',
@@ -5908,7 +6327,7 @@ _Last sync: ${p.lastSync ? new Date(p.lastSync).toLocaleTimeString('en-US', { ho
       ])
     });
   } catch (e) {
-    await ctx.reply('❌ Failed to load PnL.');
+    await ctx.reply('❌ Failed to load PnL.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
@@ -5919,7 +6338,7 @@ bot.command('refresh', async (ctx) => {
     const hasWallets = walletList.length > 0 || !!user?.myWallet;
     
     if (!hasWallets) {
-      await ctx.reply('📈 Add a wallet first.', {
+      await ctx.reply('👛 Add a wallet first.', {
         ...Markup.inlineKeyboard([[Markup.button.callback('➕ Add Wallet', 'portfolio:addwallet')]])
       });
       return;
@@ -5937,7 +6356,7 @@ bot.command('refresh', async (ctx) => {
       ...menu.portfolio(updatedUser) 
     });
   } catch (e) {
-    await ctx.reply('❌ Sync failed. Try again.');
+    await ctx.reply('❌ Sync failed. Try again.', { ...Markup.inlineKeyboard([[Markup.button.callback('🔄 Retry', 'portfolio:sync'), Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
@@ -5946,7 +6365,7 @@ bot.command('wallets', async (ctx) => {
     const user = getUser(ctx.chat.id) || createUser(ctx.chat.id);
     await ctx.reply(text.wallets(user), { parse_mode: 'Markdown', ...menu.wallets(user) });
   } catch (e) {
-    await ctx.reply('❌ Failed to load wallets.');
+    await ctx.reply('❌ Failed to load wallets.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
@@ -5956,7 +6375,7 @@ bot.command('pools', async (ctx) => {
     const user = getUser(ctx.chat.id) || createUser(ctx.chat.id);
     await ctx.reply(text.pools('volume'), { parse_mode: 'Markdown', ...menu.pools(user, 0, 'volume') });
   } catch (e) {
-    await ctx.reply('❌ Failed to load pools.');
+    await ctx.reply('❌ Failed to load pools.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
@@ -5964,7 +6383,7 @@ bot.command('trending', async (ctx) => {
   try {
     await ctx.reply(text.trending(), { parse_mode: 'Markdown', ...menu.trending() });
   } catch (e) {
-    await ctx.reply('❌ Failed to load trending pools.');
+    await ctx.reply('❌ Failed to load trending pools.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
@@ -5989,7 +6408,7 @@ bot.command('newpools', async (ctx) => {
       ...Markup.inlineKeyboard(btns) 
     });
   } catch (e) {
-    await ctx.reply('❌ Failed to load new pools.');
+    await ctx.reply('❌ Failed to load new pools.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
@@ -5998,7 +6417,7 @@ bot.command('settings', async (ctx) => {
     const user = getUser(ctx.chat.id) || createUser(ctx.chat.id);
     await ctx.reply(text.settings(user), { parse_mode: 'Markdown', ...menu.settings(user) });
   } catch (e) {
-    await ctx.reply('❌ Failed to load settings.');
+    await ctx.reply('❌ Failed to load settings.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
@@ -6006,7 +6425,9 @@ bot.command('stats', async (ctx) => {
   try {
     const user = getUser(ctx.chat.id);
     if (!user) {
-      await ctx.reply('Use /start first.');
+      await ctx.reply('👋 Get started first to track your stats!', {
+        ...Markup.inlineKeyboard([[Markup.button.callback('🚀 Get Started', 'setup:start')]])
+      });
       return;
     }
     
@@ -6047,7 +6468,7 @@ _Member since: ${new Date(user.createdAt || Date.now()).toLocaleDateString()}_`;
       ])
     });
   } catch (e) {
-    await ctx.reply('❌ Failed to load stats.');
+    await ctx.reply('❌ Failed to load stats.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
@@ -6056,7 +6477,7 @@ _Member since: ${new Date(user.createdAt || Date.now()).toLocaleDateString()}_`;
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.command('leaderboard', async (ctx) => {
   if (!checkCooldown(ctx.chat.id)) {
-    return await ctx.reply('⏳ Please wait a moment...');
+    return await ctx.reply('⏳ Too fast! Try again in a second.');
   }
   
   try {
@@ -6093,23 +6514,25 @@ bot.command('leaderboard', async (ctx) => {
       }
     }
     
-    await ctx.reply('🔄 *Loading leaderboard...*', { parse_mode: 'Markdown' });
-    
+    const loadingMsg = await ctx.reply('🔄 *Loading leaderboard...*', { parse_mode: 'Markdown' });
+
     const data = await fetchPnLLeaderboard(mint, 10);
     const message = formatLeaderboardMessage(data);
-    
-    await ctx.reply(message, { 
+
+    try { await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id); } catch (e) {}
+
+    await ctx.reply(message, {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([
         [Markup.button.callback('🔄 Refresh', `leaderboard:${mint}`)],
         [Markup.button.callback('📊 View Chart', `chart:${mint}`)],
-        [Markup.button.callback('« Menu', 'nav:main')],
+        [Markup.button.callback('🏠 Menu', 'nav:main')],
       ])
     });
     
   } catch (e) {
     log.error('Leaderboard command error:', e);
-    await ctx.reply('❌ Failed to load leaderboard. Try again later.');
+    await ctx.reply('❌ Failed to load leaderboard.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
@@ -6127,7 +6550,7 @@ bot.action(/^leaderboard:(.+)$/, async (ctx) => {
       ...Markup.inlineKeyboard([
         [Markup.button.callback('🔄 Refresh', `leaderboard:${mint}`)],
         [Markup.button.callback('📊 View Chart', `chart:${mint}`)],
-        [Markup.button.callback('« Menu', 'nav:main')],
+        [Markup.button.callback('🏠 Menu', 'nav:main')],
       ])
     });
   } catch (e) {
@@ -6140,7 +6563,7 @@ bot.action(/^leaderboard:(.+)$/, async (ctx) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.command('chart', async (ctx) => {
   if (!checkCooldown(ctx.chat.id)) {
-    return await ctx.reply('⏳ Please wait a moment...');
+    return await ctx.reply('⏳ Too fast! Try again in a second.');
   }
   
   try {
@@ -6177,8 +6600,8 @@ bot.command('chart', async (ctx) => {
       return await ctx.reply(`❌ Pool not found: ${poolIdOrSymbol}\n\nUsage: \`/chart [pool] [timeframe]\`\nTimeframes: 15m, 1h, 4h, 1d\n\nExamples:\n• /chart\n• /chart CIPHER 1h`, { parse_mode: 'Markdown' });
     }
     
-    await ctx.reply('📊 *Generating chart...*', { parse_mode: 'Markdown' });
-    
+    const chartLoadingMsg = await ctx.reply('📊 *Generating chart...*', { parse_mode: 'Markdown' });
+
     // Fetch candle data
     const candles = await fetchOHLCVData(pool.id, tf, 48);
     
@@ -6196,7 +6619,7 @@ bot.command('chart', async (ctx) => {
     // Calculate stats
     const firstPrice = candles[0].close;
     const lastPrice = candles[candles.length - 1].close;
-    const change = ((lastPrice - firstPrice) / firstPrice) * 100;
+    const change = firstPrice > 0 ? ((lastPrice - firstPrice) / firstPrice) * 100 : 0;
     const high = Math.max(...candles.map(c => c.high));
     const low = Math.min(...candles.map(c => c.low));
     const volume = candles.reduce((sum, c) => sum + c.volume, 0);
@@ -6212,9 +6635,11 @@ ${change >= 0 ? '📈' : '📉'} *Change:* ${change >= 0 ? '+' : ''}${change.toF
 
 _${candles.length} candles • Updated ${fmtTime()} UTC_`;
     
+    try { await ctx.telegram.deleteMessage(ctx.chat.id, chartLoadingMsg.message_id); } catch (e) {}
+
     await ctx.replyWithPhoto(
       { source: chartBuffer },
-      { 
+      {
         caption,
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([
@@ -6229,10 +6654,10 @@ _${candles.length} candles • Updated ${fmtTime()} UTC_`;
         ])
       }
     );
-    
+
   } catch (e) {
     log.error('Chart command error:', e);
-    await ctx.reply('❌ Failed to generate chart. Try again later.');
+    await ctx.reply('❌ Failed to generate chart.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
@@ -6264,7 +6689,7 @@ bot.action(/^chart:(.+):(.+)$/, async (ctx) => {
     
     const firstPrice = candles[0].close;
     const lastPrice = candles[candles.length - 1].close;
-    const change = ((lastPrice - firstPrice) / firstPrice) * 100;
+    const change = firstPrice > 0 ? ((lastPrice - firstPrice) / firstPrice) * 100 : 0;
     const high = Math.max(...candles.map(c => c.high));
     const low = Math.min(...candles.map(c => c.low));
     
@@ -6355,7 +6780,7 @@ bot.action(/^chart:([1-9A-HJ-NP-Za-km-z]{32,44})$/, async (ctx) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.command('liquidity', async (ctx) => {
   if (!checkCooldown(ctx.chat.id)) {
-    return await ctx.reply('⏳ Please wait a moment...');
+    return await ctx.reply('⏳ Too fast! Try again in a second.');
   }
   
   try {
@@ -6387,13 +6812,13 @@ bot.command('liquidity', async (ctx) => {
       ...Markup.inlineKeyboard([
         [Markup.button.callback('🔄 Refresh', `liqhistory:${pool.id}`)],
         [Markup.button.callback('📊 Chart', `chart:${pool.id}:1h`)],
-        [Markup.button.callback('« Menu', 'nav:main')],
+        [Markup.button.callback('🏠 Menu', 'nav:main')],
       ])
     });
     
   } catch (e) {
     log.error('Liquidity command error:', e);
-    await ctx.reply('❌ Failed to load liquidity history.');
+    await ctx.reply('❌ Failed to load liquidity history.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
@@ -6408,7 +6833,7 @@ bot.action(/^liqhistory:(.+)$/, async (ctx) => {
     ...Markup.inlineKeyboard([
       [Markup.button.callback('🔄 Refresh', `liqhistory:${poolId}`)],
       [Markup.button.callback('📊 Chart', `chart:${poolId}:1h`)],
-      [Markup.button.callback('« Menu', 'nav:main')],
+      [Markup.button.callback('🏠 Menu', 'nav:main')],
     ])
   });
 });
@@ -6438,7 +6863,7 @@ bot.action('chart:cipher', async (ctx) => {
     
     const firstPrice = candles[0].close;
     const lastPrice = candles[candles.length - 1].close;
-    const change = ((lastPrice - firstPrice) / firstPrice) * 100;
+    const change = firstPrice > 0 ? ((lastPrice - firstPrice) / firstPrice) * 100 : 0;
     
     await ctx.replyWithPhoto(
       { source: chartBuffer },
@@ -6474,7 +6899,7 @@ bot.action('leaderboard:cipher', async (ctx) => {
       ...Markup.inlineKeyboard([
         [Markup.button.callback('🔄 Refresh', `leaderboard:${MINTS.CIPHER}`)],
         [Markup.button.callback('📊 View Chart', 'chart:cipher')],
-        [Markup.button.callback('« Menu', 'nav:main')],
+        [Markup.button.callback('🏠 Menu', 'nav:main')],
       ])
     });
   } catch (e) {
@@ -6499,7 +6924,7 @@ bot.action('cmd:refreshprice', async (ctx) => {
 ◎ *SOL:* $${solPrice ? solPrice.toFixed(2) : 'N/A'}
 🔷 *CIPHER:* ${cipherPrice ? fmtPrice(cipherPrice) : 'N/A'} ${cipherChangeIcon} ${cipherChange >= 0 ? '+' : ''}${cipherChange.toFixed(2)}%
 
-_Source: ${priceApiStatus} • Updated just now_`;
+_Source: ${priceApiStatus === 'jupiter' ? 'Jupiter' : priceApiStatus === 'dexscreener' ? 'DexScreener' : priceApiStatus === 'birdeye' ? 'Birdeye' : priceApiStatus === 'coingecko' ? 'CoinGecko' : priceApiStatus} • Updated just now_`;
 
   await safeEdit(ctx, msg, { 
     parse_mode: 'Markdown',
@@ -6513,35 +6938,36 @@ _Source: ${priceApiStatus} • Updated just now_`;
 // NAV ACTIONS
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.action('nav:welcome', async (ctx) => {
-  await safeEdit(ctx, text.welcome(), { parse_mode: 'Markdown', ...menu.welcome() });
   await safeAnswer(ctx);
+  await safeEdit(ctx, text.welcome(), { parse_mode: 'Markdown', ...menu.welcome() });
 });
 
 bot.action('nav:main', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id) || createUser(ctx.chat.id);
   await safeEdit(ctx, text.dashboard(user), { parse_mode: 'Markdown', ...menu.main(user) });
-  await safeAnswer(ctx);
 });
 
 bot.action('nav:cipher', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
   await safeEdit(ctx, text.cipher(user), { parse_mode: 'Markdown', ...menu.cipher(user) });
-  await safeAnswer(ctx);
 });
 
 bot.action('nav:lp', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
   await safeEdit(ctx, text.lp(user), { parse_mode: 'Markdown', ...menu.lp(user) });
-  await safeAnswer(ctx);
 });
 
 bot.action('nav:wallets', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
   await safeEdit(ctx, text.wallets(user), { parse_mode: 'Markdown', ...menu.wallets(user) });
-  await safeAnswer(ctx);
 });
 
 bot.action('nav:allwallets', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
   const wallets = user?.wallets || [];
   const btns = wallets.map(w => [
@@ -6550,39 +6976,38 @@ bot.action('nav:allwallets', async (ctx) => {
   ]);
   btns.push([Markup.button.callback('« Back', 'nav:wallets')]);
   await safeEdit(ctx, `👛 *All Whale Wallets* (${wallets.length})`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(btns) });
-  await safeAnswer(ctx);
 });
 
 bot.action('nav:watchlist', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
   await safeEdit(ctx, text.watchlist(user), { parse_mode: 'Markdown', ...menu.watchlist(user) });
-  await safeAnswer(ctx);
 });
 
 // Pool Explorer navigation
 bot.action('nav:pools', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
   await safeEdit(ctx, text.pools('volume'), { parse_mode: 'Markdown', ...menu.pools(user, 0, 'volume') });
-  await safeAnswer(ctx);
 });
 
 bot.action('nav:trending', async (ctx) => {
-  await safeEdit(ctx, text.trending(), { parse_mode: 'Markdown', ...menu.trending() });
   await safeAnswer(ctx);
+  await safeEdit(ctx, text.trending(), { parse_mode: 'Markdown', ...menu.trending() });
 });
 
 bot.action('nav:newpools', async (ctx) => {
+  await safeAnswer(ctx);
   const newPools = getNewPools(48);
-  
+
   if (newPools.length === 0) {
-    await safeEdit(ctx, `🆕 *New Pools*\n\nNo new pools added in the last 48 hours.`, { 
-      parse_mode: 'Markdown', 
-      ...Markup.inlineKeyboard([[Markup.button.callback('« Back', 'nav:pools')]]) 
+    await safeEdit(ctx, `🆕 *New Pools*\n\nNo new pools added in the last 48 hours.`, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('📋 All Pools', 'nav:pools'), Markup.button.callback('🏠 Menu', 'nav:main')]])
     });
-    await safeAnswer(ctx);
     return;
   }
-  
+
   const btns = newPools.slice(0, 10).map(p => {
     const pairName = p.pairName || formatPair(p.baseMint || p.base, p.quoteMint || p.quote);
     const age = getPoolAge(p);
@@ -6590,62 +7015,65 @@ bot.action('nav:newpools', async (ctx) => {
     return [Markup.button.callback(`${icon} ${pairName} • ${age}`, `pool:view:${p.id}`)];
   });
   btns.push([Markup.button.callback('📋 All Pools', 'nav:pools'), Markup.button.callback('🏠 Menu', 'nav:main')]);
-  
-  await safeEdit(ctx, `🆕 *New Pools*\n\n${newPools.length} pool${newPools.length !== 1 ? 's' : ''} added recently:`, { 
-    parse_mode: 'Markdown', 
-    ...Markup.inlineKeyboard(btns) 
+
+  await safeEdit(ctx, `🆕 *New Pools*\n\n${newPools.length} pool${newPools.length !== 1 ? 's' : ''} added recently:`, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard(btns)
   });
-  await safeAnswer(ctx);
 });
 
 bot.action('nav:othersettings', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
   await safeEdit(ctx, text.otherPoolSettings(user), { parse_mode: 'Markdown', ...menu.otherPoolSettings(user) });
-  await safeAnswer(ctx);
 });
 
 // Pool pagination
 bot.action(/^pools:page:(\d+):(\w+)$/, async (ctx) => {
+  await safeAnswer(ctx);
   const page = parseInt(ctx.match[1]);
   const sortBy = ctx.match[2];
   const user = getUser(ctx.chat.id);
   await safeEdit(ctx, text.pools(sortBy), { parse_mode: 'Markdown', ...menu.pools(user, page, sortBy) });
-  await safeAnswer(ctx);
 });
 
 // Pool sorting
 bot.action(/^pools:sort:(\w+)$/, async (ctx) => {
   const sortBy = ctx.match[1];
+  const sortLabels = { volume: '24h Volume', tvl: 'TVL', trades: 'Trade Count' };
   const user = getUser(ctx.chat.id);
+  await safeAnswer(ctx, `Sorted by ${sortLabels[sortBy] || sortBy}`);
   await safeEdit(ctx, text.pools(sortBy), { parse_mode: 'Markdown', ...menu.pools(user, 0, sortBy) });
-  await safeAnswer(ctx, `Sorted by ${sortBy}`);
 });
 
 // Pool search prompt
 bot.action('pools:search', async (ctx) => {
+  await safeAnswer(ctx);
   setUserState(ctx.chat.id, { awaiting: 'poolSearch' });
   await safeEdit(ctx, `🔍 *Search Pools*
 
-Enter a token name or symbol (e.g. "SOL", "BONK"):`, { 
-    parse_mode: 'Markdown', 
-    ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'nav:pools')]]) 
+Enter a token name or symbol (e.g. "SOL", "BONK"):`, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'nav:pools')]])
   });
-  await safeAnswer(ctx);
 });
 
 // View single pool
 bot.action(/^pool:view:(.+)$/, async (ctx) => {
+  await safeAnswer(ctx);
   const poolId = ctx.match[1];
   const pool = getPoolById(poolId);
   const user = getUser(ctx.chat.id);
-  
+
   if (!pool) {
-    await safeAnswer(ctx, '❌ Pool not found');
+    await safeEdit(ctx, `❌ *Pool Not Found*\n\nThis pool may have been removed.`, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('📋 All Pools', 'nav:pools'), Markup.button.callback('🏠 Menu', 'nav:main')]])
+    });
     return;
   }
-  
+
   await safeEdit(ctx, text.poolView(pool), { parse_mode: 'Markdown', ...menu.poolView(pool, user) });
-  await safeAnswer(ctx);
 });
 
 // Toggle pool watchlist
@@ -6675,16 +7103,17 @@ bot.action(/^pool:watch:(.+)$/, async (ctx) => {
 });
 
 bot.action('nav:allwatchlist', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
   const btns = [];
-  
+
   (user?.trackedTokens || []).forEach(t => {
     btns.push([
       Markup.button.callback(`🪙 ${getSymbol(t)}`, `view:token:${t}`),
       Markup.button.callback('🗑️', `confirm:rmtoken:${t}`),
     ]);
   });
-  
+
   (user?.watchlist || []).forEach(id => {
     const p = poolMap.get(id);
     btns.push([
@@ -6692,60 +7121,63 @@ bot.action('nav:allwatchlist', async (ctx) => {
       Markup.button.callback('🗑️', `confirm:rmpool:${id}`),
     ]);
   });
-  
+
   btns.push([Markup.button.callback('« Back', 'nav:watchlist')]);
   const total = (user?.trackedTokens?.length || 0) + (user?.watchlist?.length || 0);
   await safeEdit(ctx, `⭐ *All Watchlist Items* (${total})`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(btns) });
-  await safeAnswer(ctx);
 });
 
 bot.action('nav:snooze', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
   await safeEdit(ctx, text.snooze(user), { parse_mode: 'Markdown', ...menu.snooze(user) });
-  await safeAnswer(ctx);
 });
 
 bot.action('nav:quiet', async (ctx) => {
-  const user = getUser(ctx.chat.id);
-  await safeEdit(ctx, text.quiet(), { parse_mode: 'Markdown', ...menu.quiet(user) });
   await safeAnswer(ctx);
+  const user = getUser(ctx.chat.id);
+  await safeEdit(ctx, text.quiet(user), { parse_mode: 'Markdown', ...menu.quiet(user) });
 });
 
 bot.action('nav:history', async (ctx) => {
-  const user = getUser(ctx.chat.id);
-  await safeEdit(ctx, text.history(), { parse_mode: 'Markdown', ...menu.history(user) });
   await safeAnswer(ctx);
+  const user = getUser(ctx.chat.id);
+  await safeEdit(ctx, text.history(user), { parse_mode: 'Markdown', ...menu.history(user) });
 });
 
 bot.action('nav:settings', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id) || createUser(ctx.chat.id);
   await safeEdit(ctx, text.settings(user), { parse_mode: 'Markdown', ...menu.settings(user) });
-  await safeAnswer(ctx);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PORTFOLIO ACTIONS
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.action('nav:portfolio', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id) || createUser(ctx.chat.id);
   await safeEdit(ctx, text.portfolio(user), { parse_mode: 'Markdown', ...menu.portfolio(user) });
-  await safeAnswer(ctx);
 });
 
 bot.action('portfolio:stats', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
   const walletList = user?.portfolioWallets || [];
   const hasWallets = walletList.length > 0 || !!user?.myWallet;
-  
+
   if (!hasWallets) {
-    await safeAnswer(ctx, 'Add a wallet first');
+    await safeEdit(ctx, `📊 *Portfolio Stats*\n\nAdd a wallet to view stats.`, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('➕ Add Wallet', 'portfolio:addwallet')], [Markup.button.callback('🏠 Menu', 'nav:main')]])
+    });
     return;
   }
-  
+
   const firstWallet = user.myWallet || walletList[0];
-  
-  await safeEdit(ctx, text.portfolioStats(user), { 
-    parse_mode: 'Markdown', 
+
+  await safeEdit(ctx, text.portfolioStats(user), {
+    parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [Markup.button.callback('🔄 Refresh', 'portfolio:sync')],
       [Markup.button.callback('👛 Manage Wallets', 'portfolio:wallets')],
@@ -6756,67 +7188,83 @@ bot.action('portfolio:stats', async (ctx) => {
       [Markup.button.callback('« Back', 'nav:portfolio'), Markup.button.callback('🏠 Menu', 'nav:main')],
     ])
   });
-  await safeAnswer(ctx);
 });
 
 bot.action('portfolio:tokens', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
   const walletList = user?.portfolioWallets || [];
   const hasWallets = walletList.length > 0 || !!user?.myWallet;
-  
+
   if (!hasWallets) {
-    await safeAnswer(ctx, 'Add a wallet first');
+    await safeEdit(ctx, `🪙 *Token Holdings*\n\nAdd a wallet to view tokens.`, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('➕ Add Wallet', 'portfolio:addwallet')], [Markup.button.callback('🏠 Menu', 'nav:main')]])
+    });
     return;
   }
-  
+
   const tokens = user.portfolio?.tokens || [];
   const totalValue = user.portfolio?.totalTokenValue || 0;
-  await safeEdit(ctx, text.portfolioTokens(tokens, totalValue), { 
-    parse_mode: 'Markdown', 
+  await safeEdit(ctx, text.portfolioTokens(tokens, totalValue), {
+    parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [Markup.button.callback('🔄 Refresh', 'portfolio:sync')],
       [Markup.button.callback('« Back', 'nav:portfolio')],
     ])
   });
-  await safeAnswer(ctx);
 });
 
 bot.action('portfolio:lp', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
   const walletList = user?.portfolioWallets || [];
   const hasWallets = walletList.length > 0 || !!user?.myWallet;
-  
+
   if (!hasWallets) {
-    await safeAnswer(ctx, 'Add a wallet first');
+    await safeEdit(ctx, `💧 *LP Positions*\n\nAdd a wallet to view LP positions.`, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('➕ Add Wallet', 'portfolio:addwallet')], [Markup.button.callback('🏠 Menu', 'nav:main')]])
+    });
     return;
   }
-  
+
   const positions = user.portfolio?.lpPositions || [];
   await safeEdit(ctx, text.portfolioLp(positions), { parse_mode: 'Markdown', ...menu.portfolioLp(positions) });
-  await safeAnswer(ctx);
 });
 
 bot.action('portfolio:trades', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
   const walletList = user?.portfolioWallets || [];
   const hasWallets = walletList.length > 0 || !!user?.myWallet;
-  
+
   if (!hasWallets) {
-    await safeAnswer(ctx, 'Add a wallet first');
+    await safeEdit(ctx, `📜 *Trade History*\n\nAdd a wallet to view trades.`, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('➕ Add Wallet', 'portfolio:addwallet')], [Markup.button.callback('🏠 Menu', 'nav:main')]])
+    });
     return;
   }
-  
+
   const trades = user.portfolio?.trades || [];
   await safeEdit(ctx, text.portfolioTrades(trades), { parse_mode: 'Markdown', ...menu.portfolioTrades(trades, 0) });
+});
+
+bot.action(/^portfolio:lp:(\d+)$/, async (ctx) => {
   await safeAnswer(ctx);
+  const page = parseInt(ctx.match[1]);
+  const user = getUser(ctx.chat.id);
+  const positions = user?.portfolio?.lpPositions || [];
+  await safeEdit(ctx, text.portfolioLp(positions), { parse_mode: 'Markdown', ...menu.portfolioLp(positions, page) });
 });
 
 bot.action(/^portfolio:trades:(\d+)$/, async (ctx) => {
+  await safeAnswer(ctx);
   const page = parseInt(ctx.match[1]);
   const user = getUser(ctx.chat.id);
   const trades = user?.portfolio?.trades || [];
   await safeEdit(ctx, text.portfolioTrades(trades), { parse_mode: 'Markdown', ...menu.portfolioTrades(trades, page) });
-  await safeAnswer(ctx);
 });
 
 bot.action('portfolio:sync', async (ctx) => {
@@ -6842,39 +7290,39 @@ bot.action('portfolio:sync', async (ctx) => {
 
 // Portfolio wallet management
 bot.action('portfolio:wallets', async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
   const walletList = user?.portfolioWallets || [];
   const walletCount = walletList.length || (user?.myWallet ? 1 : 0);
-  
-  await safeEdit(ctx, `👛 *Portfolio Wallets*\n\n${walletCount} wallet${walletCount !== 1 ? 's' : ''} tracked\n_Add up to 5 wallets_`, { 
-    parse_mode: 'Markdown', 
-    ...menu.portfolioWallets(user) 
+
+  await safeEdit(ctx, `👛 *Portfolio Wallets*\n\n${walletCount} wallet${walletCount !== 1 ? 's' : ''} tracked\n_Add up to 5 wallets_`, {
+    parse_mode: 'Markdown',
+    ...menu.portfolioWallets(user)
   });
-  await safeAnswer(ctx);
 });
 
 bot.action('portfolio:addwallet', async (ctx) => {
   const user = getUser(ctx.chat.id);
   const walletList = user?.portfolioWallets || [];
   const walletCount = walletList.length || (user?.myWallet ? 1 : 0);
-  
+
   if (walletCount >= 5) {
     await safeAnswer(ctx, '❌ Maximum 5 wallets allowed');
     return;
   }
-  
-  setUserState(ctx.chat.id, { awaiting: 'portfoliowallet' });
-  await safeEdit(ctx, `➕ *Add Wallet*\n\nPaste a Solana wallet address:\n\n_${walletCount}/5 wallets used_`, { 
-    parse_mode: 'Markdown', 
-    ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'portfolio:wallets')]]) 
-  });
+
   await safeAnswer(ctx);
+  setUserState(ctx.chat.id, { awaiting: 'portfoliowallet' });
+  await safeEdit(ctx, `➕ *Add Wallet*\n\nPaste a Solana wallet address:\n\n_${walletCount}/5 wallets used_`, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'portfolio:wallets')]])
+  });
 });
 
 bot.action(/^portfolio:rmwallet:(.+)$/, async (ctx) => {
+  await safeAnswer(ctx);
   const wallet = ctx.match[1];
-  const shortWallet = wallet.slice(0, 4) + '...' + wallet.slice(-4);
-  
+
   // Show confirmation dialog
   await safeEdit(ctx, `⚠️ *Remove Wallet?*\n\n\`${wallet}\`\n\nThis will remove all tracking data for this wallet.`, {
     parse_mode: 'Markdown',
@@ -6883,7 +7331,6 @@ bot.action(/^portfolio:rmwallet:(.+)$/, async (ctx) => {
       [Markup.button.callback('« Cancel', 'portfolio:wallets')],
     ])
   });
-  await safeAnswer(ctx);
 });
 
 bot.action(/^confirm:rmwallet:(.+)$/, async (ctx) => {
@@ -6928,13 +7375,14 @@ bot.action(/^confirm:rmwallet:(.+)$/, async (ctx) => {
 });
 
 bot.action(/^portfolio:view:(.+)$/, async (ctx) => {
+  await safeAnswer(ctx);
   const wallet = ctx.match[1];
   const user = getUser(ctx.chat.id);
   const walletData = user?.portfolio?.walletData?.[wallet] || {};
-  
+
   const pnlIcon = (walletData.pnl || 0) >= 0 ? '🟢' : '🔴';
-  const pnlSign = (walletData.pnl || 0) >= 0 ? '+' : '';
-  
+  const pnlSign = (walletData.pnl || 0) >= 0 ? '+' : '-';
+
   const msg = `👛 *Wallet Details*
 
 \`${wallet}\`
@@ -6948,7 +7396,7 @@ bot.action(/^portfolio:view:(.+)$/, async (ctx) => {
 🔄 Trades: ${walletData.trades || 0} (🟢 ${walletData.buys || 0} / 🔴 ${walletData.sells || 0})
 ${pnlIcon} PnL: ${pnlSign}${fmt(Math.abs(walletData.pnl || 0))}`;
 
-  await safeEdit(ctx, msg, { 
+  await safeEdit(ctx, msg, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [
@@ -6959,29 +7407,32 @@ ${pnlIcon} PnL: ${pnlSign}${fmt(Math.abs(walletData.pnl || 0))}`;
       [Markup.button.callback('« Back', 'portfolio:wallets'), Markup.button.callback('🏠 Menu', 'nav:main')],
     ])
   });
-  await safeAnswer(ctx);
 });
 
 // Legacy handler for old setwallet action
 bot.action('portfolio:setwallet', async (ctx) => {
-  setUserState(ctx.chat.id, { awaiting: 'portfoliowallet' });
-  await safeEdit(ctx, `➕ *Add Wallet*\n\nPaste a Solana wallet address:`, { 
-    parse_mode: 'Markdown', 
-    ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'nav:portfolio')]]) 
-  });
   await safeAnswer(ctx);
+  setUserState(ctx.chat.id, { awaiting: 'portfoliowallet' });
+  await safeEdit(ctx, `➕ *Add Wallet*\n\nPaste a Solana wallet address:`, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'nav:portfolio')]])
+  });
 });
 
 bot.action(/^view:lp:(.+)$/, async (ctx) => {
+  await safeAnswer(ctx);
   const poolId = ctx.match[1];
   const user = getUser(ctx.chat.id);
   const position = user?.portfolio?.lpPositions?.find(p => p.poolId === poolId);
-  
+
   if (!position) {
-    await safeAnswer(ctx, 'Position not found');
+    await safeEdit(ctx, `❌ *Position Not Found*\n\nThis LP position may have been closed.`, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('💧 LP Positions', 'portfolio:lp'), Markup.button.callback('🏠 Menu', 'nav:main')]])
+    });
     return;
   }
-  
+
   const pool = poolMap.get(poolId);
   const baseMint = pool?.baseMint || pool?.base || position.baseMint || poolId;
   
@@ -6994,7 +7445,7 @@ ${position.isCipher ? '🔷 CIPHER Pool' : '🌐 Other Pool'}
 📊 Shares: ${position.shares.toFixed(6)}
 💰 Value: ${fmt(position.valueUsd)}`;
 
-  await safeEdit(ctx, msg, { 
+  await safeEdit(ctx, msg, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [
@@ -7004,35 +7455,44 @@ ${position.isCipher ? '🔷 CIPHER Pool' : '🌐 Other Pool'}
       [Markup.button.callback('« Back', 'portfolio:lp'), Markup.button.callback('🏠 Menu', 'nav:main')],
     ])
   });
-  await safeAnswer(ctx);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INFO ACTIONS
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.action('info:about', async (ctx) => {
+  await safeAnswer(ctx);
   await safeEdit(ctx, text.about(), { parse_mode: 'Markdown', disable_web_page_preview: true, ...Markup.inlineKeyboard([
     [Markup.button.callback('🚀 Get Started', 'setup:start')],
     [Markup.button.callback('« Back', 'nav:welcome'), Markup.button.callback('🏠 Menu', 'nav:main')],
   ])});
-  await safeAnswer(ctx);
 });
 
 bot.action('info:help', async (ctx) => {
+  await safeAnswer(ctx);
   await safeEdit(ctx, text.help(), { parse_mode: 'Markdown', disable_web_page_preview: true, ...Markup.inlineKeyboard([
     [Markup.button.url('🌐 Orbit Markets', 'https://markets.cipherlabsx.com')],
     [Markup.button.url('🐦 Twitter', 'https://x.com/cipherlabsx')],
     [Markup.button.callback('« Back', 'nav:settings'), Markup.button.callback('🏠 Menu', 'nav:main')],
   ])});
-  await safeAnswer(ctx);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SETUP
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.action('setup:start', async (ctx) => {
-  await safeEdit(ctx, '🎯 *Quick Setup*\n\nWhat do you want to track?', { parse_mode: 'Markdown', ...menu.setup() });
   await safeAnswer(ctx);
+  await safeEdit(ctx, `🎯 *Quick Setup*
+
+Choose a preset to get started:
+
+🔷 *CIPHER Alerts* — Buy/sell trades & LP events for the CIPHER pool. Best for CIPHER holders.
+
+💧 *LP Tracking* — Liquidity add/remove events across all pools. Best for LPs.
+
+📊 *Everything* — All trade & LP alerts for every pool. Full coverage.
+
+_You can customize thresholds anytime from Settings._`, { parse_mode: 'Markdown', ...menu.setup() });
 });
 
 bot.action(/^preset:(.+)$/, async (ctx) => {
@@ -7048,18 +7508,38 @@ bot.action(/^preset:(.+)$/, async (ctx) => {
   updateUser(ctx.chat.id, { ...presets[mode], onboarded: true });
   const user = getUser(ctx.chat.id);
   
-  await safeEdit(ctx, `✅ *You're all set!*\n\nMode: *${modeNames[mode]}*\n\nAlerts will appear in this chat.`, { parse_mode: 'Markdown', ...menu.main(user) });
+  await safeEdit(ctx, `✅ *You're all set!*
+
+Mode: *${modeNames[mode]}*
+Alerts will appear in this chat.
+
+*Next steps:*
+• 👛 Add a wallet to track whale activity
+• 📈 Link your wallet for portfolio & PnL
+• 🌐 Browse pools to build your watchlist
+• ⚙️ Adjust alert thresholds in Settings`, { parse_mode: 'Markdown', ...menu.main(user) });
   await safeAnswer(ctx, '✅ Setup complete!');
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TOGGLES
 // ═══════════════════════════════════════════════════════════════════════════════
+const ALLOWED_TOGGLES = new Set([
+  'enabled', 'cipherBuys', 'cipherSells', 'cipherLpAdd', 'cipherLpRemove',
+  'trackOtherPools', 'otherLpAdd', 'otherLpRemove', 'otherBuys', 'otherSells',
+  'walletAlerts', 'dailyDigest', 'newPoolAlerts', 'lockAlerts', 'rewardAlerts',
+]);
+
 bot.action(/^tog:(.+)$/, async (ctx) => {
   const field = ctx.match[1];
   const user = getUser(ctx.chat.id);
   if (!user) { await safeAnswer(ctx); return; }
-  
+
+  if (!ALLOWED_TOGGLES.has(field)) {
+    await safeAnswer(ctx, '❌ Invalid setting');
+    return;
+  }
+
   updateUser(ctx.chat.id, { [field]: !user[field] });
   const updated = getUser(ctx.chat.id);
   
@@ -7068,8 +7548,10 @@ bot.action(/^tog:(.+)$/, async (ctx) => {
   if (field === 'walletAlerts') {
     refreshWalletSubscriptions();
     await safeEdit(ctx, text.wallets(updated), { parse_mode: 'Markdown', ...menu.wallets(updated) });
-  } else if (field === 'trackOtherPools' || field === 'enabled') {
-    await safeEdit(ctx, text.dashboard(updated), { parse_mode: 'Markdown', ...menu.main(updated) });
+  } else if (field === 'trackOtherPools') {
+    await safeEdit(ctx, text.otherPoolSettings(updated), { parse_mode: 'Markdown', ...menu.otherPoolSettings(updated) });
+  } else if (field === 'enabled') {
+    await safeEdit(ctx, text.settings(updated), { parse_mode: 'Markdown', ...menu.settings(updated) });
   } else if (field.startsWith('cipher')) {
     await safeEdit(ctx, text.cipher(updated), { parse_mode: 'Markdown', ...menu.cipher(updated) });
   } else if (field.startsWith('otherLp')) {
@@ -7092,11 +7574,11 @@ bot.action(/^tog:(.+)$/, async (ctx) => {
 // THRESHOLDS
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.action(/^thresh:(.+)$/, async (ctx) => {
+  await safeAnswer(ctx);
   const type = ctx.match[1];
   const user = getUser(ctx.chat.id);
   const currentMap = { cipher: user?.cipherThreshold, lp: user?.otherLpThreshold, other: user?.otherThreshold, watch: user?.otherThreshold };
   await safeEdit(ctx, `💰 *Set Minimum Amount*\n\nOnly get alerts above this value:`, { parse_mode: 'Markdown', ...menu.threshold(type, currentMap[type]) });
-  await safeAnswer(ctx);
 });
 
 bot.action(/^setth:(.+):(\d+)$/, async (ctx) => {
@@ -7146,7 +7628,7 @@ bot.action(/^quiet:(\d+):(\d+)$/, async (ctx) => {
   updateUser(ctx.chat.id, { quietStart: start, quietEnd: end });
   await safeAnswer(ctx, `🌙 Quiet hours set!`);
   const user = getUser(ctx.chat.id);
-  await safeEdit(ctx, text.quiet(), { parse_mode: 'Markdown', ...menu.quiet(user) });
+  await safeEdit(ctx, text.quiet(user), { parse_mode: 'Markdown', ...menu.quiet(user) });
 });
 
 bot.action('quiet:off', async (ctx) => {
@@ -7160,44 +7642,39 @@ bot.action('quiet:off', async (ctx) => {
 // BROWSE
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.action(/^browse:(\d+)$/, async (ctx) => {
+  await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
   await safeEdit(ctx, `💎 *Browse Pools*\n\nTap to add to your watchlist:`, { parse_mode: 'Markdown', ...menu.browse(parseInt(ctx.match[1]), user) });
-  await safeAnswer(ctx);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INPUT
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.action('input:wallet', async (ctx) => {
+  await safeAnswer(ctx);
   setUserState(ctx.chat.id, { awaiting: 'wallet' });
   await safeEdit(ctx, text.addWallet(), { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'nav:wallets')]]) });
-  await safeAnswer(ctx);
 });
 
 bot.action('input:search', async (ctx) => {
+  await safeAnswer(ctx);
   setUserState(ctx.chat.id, { awaiting: 'search' });
   await safeEdit(ctx, text.search(), { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'nav:watchlist')]]) });
-  await safeAnswer(ctx);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIRM & DO
 // ═══════════════════════════════════════════════════════════════════════════════
-bot.action(/^confirm:(.+):(.+)$/, async (ctx) => {
-  const [action, id] = [ctx.match[1], ctx.match[2]];
-  const labels = { rmwallet: 'remove this wallet', rmtoken: 'stop tracking this token', rmpool: 'remove this pool' };
-  await safeEdit(ctx, `⚠️ *Are you sure?*\n\nThis will ${labels[action] || 'delete this item'}.`, { parse_mode: 'Markdown', ...menu.confirm(`${action}:${id}`, 'confirm') });
-  await safeAnswer(ctx);
-});
+// Specific confirm handlers (rmtoken, rmpool, rmwhale) are below — no generic catch-all needed
 
 bot.action('confirm:resetstats', async (ctx) => {
-  await safeEdit(ctx, `⚠️ *Reset Statistics?*\n\nThis will clear all your stats and history.`, { parse_mode: 'Markdown', ...menu.confirm('resetstats', 'reset everything') });
   await safeAnswer(ctx);
+  await safeEdit(ctx, `⚠️ *Reset Statistics?*\n\nThis will clear all your stats and history.`, { parse_mode: 'Markdown', ...menu.confirm('resetstats', 'reset everything') });
 });
 
 bot.action('confirm:clearwatchlist', async (ctx) => {
-  await safeEdit(ctx, `⚠️ *Clear Watchlist?*\n\nThis will remove all items from your watchlist.`, { parse_mode: 'Markdown', ...menu.confirm('clearwatchlist', 'clear all') });
   await safeAnswer(ctx);
+  await safeEdit(ctx, `⚠️ *Clear Watchlist?*\n\nThis will remove all items from your watchlist.`, { parse_mode: 'Markdown', ...menu.confirm('clearwatchlist', 'clear all') });
 });
 
 bot.action(/^do:rmwallet:(.+)$/, async (ctx) => {
@@ -7235,7 +7712,7 @@ bot.action(/^do:rmpool:(.+)$/, async (ctx) => {
 });
 
 bot.action('do:resetstats', async (ctx) => {
-  updateUser(ctx.chat.id, { 
+  updateUser(ctx.chat.id, {
     stats: { cipherBuys: 0, cipherSells: 0, cipherLp: 0, otherLp: 0, otherTrades: 0, walletAlerts: 0, volume: 0 },
     todayStats: { trades: 0, lp: 0, wallet: 0, lastReset: Date.now() },
     recentAlerts: [],
@@ -7254,9 +7731,10 @@ bot.action('do:clearwatchlist', async (ctx) => {
 
 // Token removal confirmation
 bot.action(/^confirm:rmtoken:(.+)$/, async (ctx) => {
+  await safeAnswer(ctx);
   const mint = ctx.match[1];
   const symbol = getSymbol(mint);
-  
+
   await safeEdit(ctx, `⚠️ *Remove Token?*\n\n🪙 ${symbol}\n\nRemove from your watchlist?`, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
@@ -7264,15 +7742,15 @@ bot.action(/^confirm:rmtoken:(.+)$/, async (ctx) => {
       [Markup.button.callback('« Cancel', 'nav:watchlist')],
     ])
   });
-  await safeAnswer(ctx);
 });
 
 // Pool removal confirmation
 bot.action(/^confirm:rmpool:(.+)$/, async (ctx) => {
+  await safeAnswer(ctx);
   const poolId = ctx.match[1];
   const pool = poolMap.get(poolId);
   const pairName = pool?.pairName || 'Pool';
-  
+
   await safeEdit(ctx, `⚠️ *Remove Pool?*\n\n💧 ${pairName}\n\nRemove from your watchlist?`, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
@@ -7280,7 +7758,6 @@ bot.action(/^confirm:rmpool:(.+)$/, async (ctx) => {
       [Markup.button.callback('« Cancel', 'nav:watchlist')],
     ])
   });
-  await safeAnswer(ctx);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -7292,11 +7769,18 @@ bot.action(/^add:pool:([^:]+):browse:(\d+)$/, async (ctx) => {
   const user = getUser(ctx.chat.id);
   if (user) {
     user.watchlist = user.watchlist || [];
-    if (!user.watchlist.includes(poolId)) user.watchlist.push(poolId);
-    saveUsersDebounced();  // Debounced for performance
+    const totalItems = (user.watchlist?.length || 0) + (user.trackedTokens?.length || 0);
+    if (totalItems >= CONFIG.maxWatchlistItems) {
+      await safeAnswer(ctx, `Watchlist full (${CONFIG.maxWatchlistItems} max)`);
+    } else if (!user.watchlist.includes(poolId)) {
+      user.watchlist.push(poolId);
+      saveUsersDebounced();
+      const pool = poolMap.get(poolId);
+      await safeAnswer(ctx, `✅ Added ${pool?.pairName || ''}`);
+    } else {
+      await safeAnswer(ctx, 'Already in watchlist');
+    }
   }
-  const pool = poolMap.get(poolId);
-  await safeAnswer(ctx, `✅ Added ${pool?.pairName || ''}`);
   await safeEdit(ctx, `💎 *Browse Pools*\n\nTap to add to your watchlist:`, { parse_mode: 'Markdown', ...menu.browse(page, user) });
 });
 
@@ -7333,11 +7817,18 @@ bot.action(/^add:pool:([^:]+)$/, async (ctx) => {
   const user = getUser(ctx.chat.id);
   if (user) {
     user.watchlist = user.watchlist || [];
-    if (!user.watchlist.includes(poolId)) user.watchlist.push(poolId);
-    saveUsersDebounced();  // Debounced for performance
+    const totalItems = (user.watchlist?.length || 0) + (user.trackedTokens?.length || 0);
+    if (totalItems >= CONFIG.maxWatchlistItems) {
+      await safeAnswer(ctx, `Watchlist full (${CONFIG.maxWatchlistItems} max)`);
+    } else if (!user.watchlist.includes(poolId)) {
+      user.watchlist.push(poolId);
+      saveUsersDebounced();
+      const pool = poolMap.get(poolId);
+      await safeAnswer(ctx, `✅ Added ${pool?.pairName || ''}`);
+    } else {
+      await safeAnswer(ctx, 'Already in watchlist');
+    }
   }
-  const pool = poolMap.get(poolId);
-  await safeAnswer(ctx, `✅ Added ${pool?.pairName || ''}`);
   await safeEdit(ctx, text.watchlist(user), { parse_mode: 'Markdown', ...menu.watchlist(user) });
 });
 
@@ -7398,9 +7889,10 @@ bot.action(/^addall:(.+)$/, async (ctx) => {
 // VIEW
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.action(/^view:wallet:(.+)$/, async (ctx) => {
+  await safeAnswer(ctx);
   const wallet = ctx.match[1];
-  await safeEdit(ctx, `👛 *Whale Wallet*\n\n\`${wallet}\`\n\n_Tracking activity from this wallet_`, { 
-    parse_mode: 'Markdown', 
+  await safeEdit(ctx, `👛 *Whale Wallet*\n\n\`${wallet}\`\n\n_Tracking activity from this wallet_`, {
+    parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [
         Markup.button.url('🔍 Solscan', `https://solscan.io/account/${wallet}`),
@@ -7410,13 +7902,13 @@ bot.action(/^view:wallet:(.+)$/, async (ctx) => {
       [Markup.button.callback('« Back', 'nav:wallets'), Markup.button.callback('🏠 Menu', 'nav:main')],
     ])
   });
-  await safeAnswer(ctx);
 });
 
 // Handler to confirm whale wallet removal
 bot.action(/^confirm:rmwhale:(.+)$/, async (ctx) => {
+  await safeAnswer(ctx);
   const wallet = ctx.match[1];
-  
+
   await safeEdit(ctx, `⚠️ *Remove Whale Wallet?*\n\n\`${wallet}\`\n\nYou'll stop receiving alerts for this wallet.`, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
@@ -7424,7 +7916,6 @@ bot.action(/^confirm:rmwhale:(.+)$/, async (ctx) => {
       [Markup.button.callback('« Cancel', 'nav:wallets')],
     ])
   });
-  await safeAnswer(ctx);
 });
 
 // Execute whale wallet removal
@@ -7449,6 +7940,7 @@ bot.action(/^do:rmwhale:(.+)$/, async (ctx) => {
 });
 
 bot.action(/^view:token:(.+)$/, async (ctx) => {
+  await safeAnswer(ctx, '🔄 Loading...');
   const mint = ctx.match[1];
   const user = getUser(ctx.chat.id);
   const tokenPools = findPoolsByToken(mint);
@@ -7483,36 +7975,41 @@ ${overviewText}
 *${tokenPools.length} pool${tokenPools.length !== 1 ? 's' : ''} on Orbit:*`;
 
   await safeEdit(ctx, msg, { parse_mode: 'Markdown', ...menu.tokenPools(mint, user) });
-  await safeAnswer(ctx);
 });
 
 bot.action(/^view:pool:(.+)$/, async (ctx) => {
+  await safeAnswer(ctx);
   const poolId = ctx.match[1];
   const pool = poolMap.get(poolId);
   const user = getUser(ctx.chat.id);
-  
-  if (!pool) { await safeAnswer(ctx, 'Pool not found'); return; }
-  
-  const baseMint = pool.baseMint || pool.base;
-  const basePrice = getPrice(baseMint);
-  const priceStr = basePrice ? `\n💰 Price: ${fmtPrice(basePrice)}` : '';
-  
+
+  if (!pool) {
+    await safeEdit(ctx, `❌ *Pool Not Found*\n\nThis pool may have been removed.`, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('⭐ Watchlist', 'nav:watchlist'), Markup.button.callback('🏠 Menu', 'nav:main')]])
+    });
+    return;
+  }
+
   const inList = user?.watchlist?.includes(poolId);
-  await safeEdit(ctx, `💎 *${pool.pairName}*\n\n${pool.isCipher ? '🔷 CIPHER Pool' : '🌐 Other Pool'}${priceStr}`, { 
-    parse_mode: 'Markdown', 
+  const baseMint = pool.baseMint || pool.base;
+  await safeEdit(ctx, text.poolView(pool), {
+    parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
-      [Markup.button.callback(inList ? '🗑️ Remove from Watchlist' : '➕ Add to Watchlist', inList ? `confirm:rmpool:${poolId}` : `add:pool:${poolId}`)],
+      [Markup.button.callback('📊 Chart', `chart:${poolId}:1h`),
+       Markup.button.callback('💧 LP History', `liqhistory:${poolId}`)],
+      [Markup.button.callback(inList ? '❌ Remove from Watchlist' : '➕ Add to Watchlist', inList ? `confirm:rmpool:${poolId}` : `add:pool:${poolId}`)],
       [
-        Markup.button.url('📊 Chart', `https://dexscreener.com/solana/${baseMint}`),
         Markup.button.url('🔍 Solscan', `https://solscan.io/account/${poolId}`),
+        Markup.button.url('🦅 Birdeye', `https://birdeye.so/token/${baseMint}?chain=solana`),
       ],
       [Markup.button.callback('« Back', 'nav:watchlist'), Markup.button.callback('🏠 Menu', 'nav:main')],
     ])
   });
-  await safeAnswer(ctx);
 });
 
 bot.action('noop', (ctx) => safeAnswer(ctx));
+bot.action('noop_alert', (ctx) => safeAnswer(ctx, 'No transaction link available'));
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TEXT HANDLER
@@ -7680,7 +8177,10 @@ bot.on('text', async (ctx) => {
         await ctx.reply(`✅ Wallet added!\n\n⚠️ Couldn't load data. Tap Refresh to retry.`, { parse_mode: 'Markdown', ...menu.portfolio(updatedUser) });
       }
     }
-  } catch (e) {}
+  } catch (e) {
+    log.error('Text handler error:', e.message);
+    try { await ctx.reply('❌ Something went wrong. Please try again.'); } catch (e2) {}
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -7730,7 +8230,7 @@ async function sendDailyDigests() {
         portfolioSection = `
 📈 *Your Portfolio*
 💎 Net Worth: ${fmt(totalValue)}
-${pnlIcon} PnL: ${pnl >= 0 ? '+' : ''}${fmt(Math.abs(pnl))}
+${pnlIcon} PnL: ${pnl >= 0 ? '+' : '-'}${fmt(Math.abs(pnl))}
 `;
       }
       
@@ -7751,7 +8251,7 @@ ${portfolioSection}
 
 *All Time*
 📈 Total Volume Tracked: ${fmt(allTimeStats.volume || 0)}
-🔄 Total Alerts: ${(allTimeStats.cipherBuys || 0) + (allTimeStats.cipherSells || 0) + (allTimeStats.otherTrades || 0)}
+🔄 Total Alerts: ${(allTimeStats.cipherBuys || 0) + (allTimeStats.cipherSells || 0) + (allTimeStats.cipherLp || 0) + (allTimeStats.otherLp || 0) + (allTimeStats.otherTrades || 0) + (allTimeStats.walletAlerts || 0)}
 
 _Have a great day! 🚀_`;
 
@@ -7773,7 +8273,8 @@ _Have a great day! 🚀_`;
       
     } catch (e) {
       errors++;
-      if (e.code === 403 || e.description?.includes('blocked')) {
+      if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
+        user.enabled = false;
         user.blocked = true;
         saveUserDebounced(user);
       }
@@ -7781,6 +8282,12 @@ _Have a great day! 🚀_`;
     }
   }
   
+  // Reset todayStats for all users after digest is sent
+  for (const user of users.values()) {
+    user.todayStats = { trades: 0, lp: 0, wallet: 0, lastReset: Date.now() };
+  }
+  saveUsersDebounced();
+
   log.info(`📬 Daily digest: sent ${sent}, errors ${errors}`);
 }
 
@@ -7829,12 +8336,12 @@ async function broadcastTradeAlert({ pool, trade, usd, isBuy, sig }) {
   // Header with visual distinction
   let header;
   if (isBuy) {
-    header = isCipher 
-      ? `🔷 ━━━━━ *BUY* ━━━━━ 🔷`
+    header = isCipher
+      ? `🔷🟢 ━━━━ *BUY* ━━━━ 🟢🔷`
       : `🟢 ━━━━━ *BUY* ━━━━━ 🟢`;
   } else {
     header = isCipher
-      ? `🔷 ━━━━━ *SELL* ━━━━━ 🔷`
+      ? `🔷🔴 ━━━━ *SELL* ━━━━ 🔴🔷`
       : `🔴 ━━━━━ *SELL* ━━━━━ 🔴`;
   }
   
@@ -7871,10 +8378,14 @@ ${size.bar} ${size.tier}
     }
   }
   
-  // Footer
-  msg += `
+  // Trader address
+  const trader = trade.wallet || trade.user || trade.owner || trade.maker || trade.taker;
+  if (trader) {
+    msg += `\n\n👤 \`${shortAddr(trader)}\``;
+  }
 
-⏱ ${fmtTime()} UTC • Orbit`;
+  // Footer
+  msg += `\n⏱ ${fmtTime()} UTC • Orbit`;
 
   // Send with small delays to avoid Telegram rate limits
   for (let i = 0; i < toNotify.length; i++) {
@@ -7914,12 +8425,12 @@ async function broadcastLpAlert({ pool, isAdd, usd, sig, msg: originalMsg }) {
     let shouldSend = false;
     
     if (pool.isCipher) {
-      if (isAdd && user.cipherLpAdd) shouldSend = true;
-      if (!isAdd && user.cipherLpRemove) shouldSend = true;
+      if (isAdd && user.cipherLpAdd && usd >= (user.cipherThreshold || 100)) shouldSend = true;
+      if (!isAdd && user.cipherLpRemove && usd >= (user.cipherThreshold || 100)) shouldSend = true;
     } else {
       if (user.trackOtherPools === false) continue;
-      if (isAdd && user.otherLpAdd && usd >= user.otherLpThreshold) shouldSend = true;
-      if (!isAdd && user.otherLpRemove && usd >= user.otherLpThreshold) shouldSend = true;
+      if (isAdd && user.otherLpAdd && usd >= (user.otherLpThreshold || 500)) shouldSend = true;
+      if (!isAdd && user.otherLpRemove && usd >= (user.otherLpThreshold || 500)) shouldSend = true;
     }
     
     if (shouldSend) toNotify.push(user);
@@ -8011,18 +8522,22 @@ ${size.bar} ${size.tier}
 }
 
 async function broadcastWalletAlert({ wallet, signature, tokenSymbol, isBuy, usdValue }) {
+  const toNotify = [];
   for (const user of users.values()) {
-    if (!user.enabled || !user.walletAlerts || isUserSnoozed(user)) continue;
+    if (!user.enabled || user.blocked || !user.walletAlerts || isUserSnoozed(user)) continue;
     if (!user.wallets?.includes(wallet)) continue;
-    
-    const size = getSizeTier(usdValue);
-    
-    // Header
-    const header = isBuy
-      ? `🐋 ━━━ *WHALE BUY* ━━━ 🐋`
-      : `🐋 ━━━ *WHALE SELL* ━━━ 🐋`;
-    
-    const msg = `${header}
+    toNotify.push(user);
+  }
+  if (toNotify.length === 0) return;
+
+  const size = getSizeTier(usdValue);
+
+  // Header
+  const header = isBuy
+    ? `🐋 ━━━ *WHALE BUY* ━━━ 🐋`
+    : `🐋 ━━━ *WHALE SELL* ━━━ 🐋`;
+
+  const msg = `${header}
 *${tokenSymbol}*
 
 💵 *${fmt(usdValue)}*
@@ -8033,22 +8548,151 @@ ${size.bar} ${size.tier}
 
 ⏱ ${fmtTime()} UTC • Orbit`;
 
+  for (let i = 0; i < toNotify.length; i++) {
+    const user = toNotify[i];
     try {
-      await bot.telegram.sendMessage(user.chatId, msg, { 
-        parse_mode: 'Markdown', 
+      await bot.telegram.sendMessage(user.chatId, msg, {
+        parse_mode: 'Markdown',
         disable_web_page_preview: true,
         ...menu.walletAlertActions(signature)
       });
-      
+
       user.stats.walletAlerts = (user.stats.walletAlerts || 0) + 1;
       user.todayStats.wallet++;
-      
+
       addRecentAlert(user.chatId, { type: 'wallet', token: tokenSymbol, usd: usdValue, wallet: shortAddr(wallet), sig: signature });
+
+      if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
-      if (e.code === 403) updateUser(user.chatId, { enabled: false });
+      if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
+        user.enabled = false;
+        user.blocked = true;
+      }
     }
   }
   saveUsersDebounced();  // Debounced for performance
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NEW POOL / LOCK / REWARD ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function broadcastNewPoolAlert({ poolId, user: creator, sig, timestamp }) {
+  const pool = poolMap.get(poolId);
+  const pairName = pool?.pairName || 'Unknown Pool';
+
+  const toNotify = [];
+  for (const u of users.values()) {
+    if (!u.enabled || u.blocked || isUserSnoozed(u)) continue;
+    if (u.newPoolAlerts !== false) toNotify.push(u);
+  }
+  if (toNotify.length === 0) return;
+
+  const creatorAddr = creator ? `\n👤 Creator: \`${shortAddr(creator)}\`` : '';
+  const msg = `🆕 ━━━ *NEW POOL* ━━━ 🆕
+*${pairName}*
+${creatorAddr}
+\`${poolId || 'N/A'}\`
+
+⏱ ${fmtTime()} UTC • Orbit`;
+
+  for (let i = 0; i < toNotify.length; i++) {
+    const u = toNotify[i];
+    try {
+      await bot.telegram.sendMessage(u.chatId, msg, {
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+        ...(poolId && sig ? menu.alertActions(poolId, sig) : {}),
+      });
+      addRecentAlert(u.chatId, { type: 'pool_init', pair: pairName, usd: 0, sig });
+      if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
+    } catch (e) {
+      if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
+        u.enabled = false;
+        u.blocked = true;
+      }
+    }
+  }
+  saveUsersDebounced();
+}
+
+async function broadcastLockAlert({ poolId, isLock, user: actor, sig, timestamp }) {
+  const pool = poolMap.get(poolId);
+  const pairName = pool?.pairName || 'Unknown Pool';
+
+  const toNotify = [];
+  for (const u of users.values()) {
+    if (!u.enabled || u.blocked || isUserSnoozed(u)) continue;
+    if (u.lockAlerts !== false) toNotify.push(u);
+  }
+  if (toNotify.length === 0) return;
+
+  const icon = isLock ? '🔒' : '🔓';
+  const action = isLock ? 'LIQUIDITY LOCKED' : 'LIQUIDITY UNLOCKED';
+  const actorAddr = actor ? `\n👤 \`${shortAddr(actor)}\`` : '';
+
+  const msg = `${icon} ━━━ *${action}* ━━━ ${icon}
+*${pairName}*
+${actorAddr}
+⏱ ${fmtTime()} UTC • Orbit`;
+
+  for (let i = 0; i < toNotify.length; i++) {
+    const u = toNotify[i];
+    try {
+      await bot.telegram.sendMessage(u.chatId, msg, {
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+        ...(poolId && sig ? menu.alertActions(poolId, sig) : {}),
+      });
+      addRecentAlert(u.chatId, { type: isLock ? 'lock' : 'unlock', pair: pairName, usd: 0, sig });
+      if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
+    } catch (e) {
+      if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
+        u.enabled = false;
+        u.blocked = true;
+      }
+    }
+  }
+  saveUsersDebounced();
+}
+
+async function broadcastRewardClaimAlert({ user: claimer, sig, poolId, timestamp }) {
+  const pool = poolId ? poolMap.get(poolId) : null;
+  const pairName = pool?.pairName || '';
+
+  const toNotify = [];
+  for (const u of users.values()) {
+    if (!u.enabled || u.blocked || isUserSnoozed(u)) continue;
+    if (u.rewardAlerts !== false) toNotify.push(u);
+  }
+  if (toNotify.length === 0) return;
+
+  const claimerAddr = claimer ? `\n👤 \`${shortAddr(claimer)}\`` : '';
+  const poolLine = pairName ? `\n*Pool:* ${pairName}` : '';
+
+  const msg = `🎁 ━━━ *REWARDS CLAIMED* ━━━ 🎁
+${poolLine}${claimerAddr}
+
+⏱ ${fmtTime()} UTC • Orbit`;
+
+  for (let i = 0; i < toNotify.length; i++) {
+    const u = toNotify[i];
+    try {
+      await bot.telegram.sendMessage(u.chatId, msg, {
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+        ...(sig ? menu.walletAlertActions(sig) : {}),
+      });
+      addRecentAlert(u.chatId, { type: 'reward', pair: pairName, usd: 0, sig });
+      if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
+    } catch (e) {
+      if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
+        u.enabled = false;
+        u.blocked = true;
+      }
+    }
+  }
+  saveUsersDebounced();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -8067,9 +8711,27 @@ async function start() {
     process.exit(1);
   }
   
-  loadUsers();
+  try {
+    loadUsers();
+  } catch (e) {
+    log.error('Failed to load users, starting with empty user set:', e.message);
+  }
+  loadSeenTxs();
   await loadTokens();
-  await fetchPools();
+
+  // Retry critical startup fetches up to 3 times
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await fetchPools();
+      if (pools.length > 0) break;
+      log.warn(`Attempt ${attempt}/3: fetchPools returned 0 pools, retrying...`);
+    } catch (e) {
+      log.warn(`Attempt ${attempt}/3: fetchPools failed: ${e.message}`);
+    }
+    if (attempt < 3) await new Promise(r => setTimeout(r, 5000));
+  }
+  if (pools.length === 0) log.error('WARNING: Starting with 0 pools. Alerts will not work until pools are fetched.');
+
   await fetchPrices();
   await fetchVolumes();
   await checkOrbitHealth();
@@ -8096,6 +8758,15 @@ async function start() {
     cleanUserStakeCache();
     cleanBalanceCache();
     cleanSeenTxs();
+    // Prune token map if it grows too large (keep pool-referenced + core tokens)
+    if (tokens.size > 50000) {
+      const keepMints = new Set(Object.values(MINTS));
+      pools.forEach(p => { keepMints.add(p.mintX); keepMints.add(p.mintY); });
+      for (const [mint] of tokens) {
+        if (!keepMints.has(mint)) tokens.delete(mint);
+      }
+      log.info(`🧹 Pruned token map from >50k to ${tokens.size} entries`);
+    }
     log.debug(`🧹 Cache cleanup: price=${priceCache.size}, tokens=${tokens.size}, users=${users.size}`);
   }, 15 * 60 * 1000);
   
@@ -8146,13 +8817,13 @@ async function start() {
     // Could add weekly summary feature here
   }, { timezone: 'UTC' });
   
-  // Database optimization (daily at 3 AM UTC)
+  // Database optimization (daily at 3 AM UTC) — pragma optimize only, no VACUUM in WAL mode
   cron.schedule('0 3 * * *', () => {
     log.info('🔧 Running database optimization...');
     try {
       if (db) {
         db.pragma('optimize');
-        db.exec('VACUUM');
+        db.pragma('wal_checkpoint(TRUNCATE)');
         log.info('✅ Database optimized');
       }
     } catch (e) {
