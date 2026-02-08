@@ -28,8 +28,6 @@ const { z } = require('zod');
 // Solana SDKs
 const { Helius } = require('helius-sdk');
 const { Connection, PublicKey, LAMPORTS_PER_SOL } = require('@solana/web3.js');
-const bs58 = require('bs58');
-
 // Chart generation - DISABLED for Railway compatibility
 const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
 
@@ -209,16 +207,6 @@ async function getRecentTransactions(walletAddress, limit = 10) {
   }
 }
 
-// Check if an address is valid
-function isValidPublicKey(address) {
-  try {
-    new PublicKey(address);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 // Orbit API endpoints helper
 const ORBIT = {
   health: () => `${CONFIG.orbitApi}/health`,
@@ -357,6 +345,10 @@ const TX_TYPE = {
   FEES_DISTRIBUTED: 'fees_distributed',
   CLAIM_REWARDS: 'claim_rewards',
   SYNC_STAKE: 'sync_stake',
+  CLOSE_POOL: 'close_pool',
+  PROTOCOL_FEES: 'protocol_fees',
+  ADMIN: 'admin',
+  SETUP: 'setup',
   UNKNOWN: 'unknown',
 };
 
@@ -366,25 +358,43 @@ const TX_TYPE = {
  */
 const ORBIT_DISCRIMINATORS = {
   instructions: {
-    // Swap (both IDL versions — program may use either name)
+    // Swap
     swap: [248, 198, 158, 145, 225, 117, 135, 200],
-    swap_v2: [43, 4, 237, 11, 26, 201, 30, 98],
     // Liquidity
     add_liquidity_v2: [126, 118, 210, 37, 80, 190, 19, 105],
     add_liquidity_batch: [254, 87, 215, 234, 0, 131, 76, 231],
-    // Withdraw (both IDL versions)
     withdraw: [183, 18, 70, 156, 148, 109, 161, 34],
-    withdraw_v2: [242, 80, 163, 0, 196, 221, 194, 194],
     close_position: [123, 134, 81, 0, 49, 68, 98, 98],
     // Pool management
     init_pool: [116, 233, 199, 204, 115, 159, 171, 36],
+    close_pool: [140, 189, 209, 23, 239, 62, 239, 11],
     init_position: [197, 20, 10, 1, 97, 160, 177, 91],
+    init_position_bin: [249, 110, 124, 16, 185, 55, 149, 13],
+    create_bin_array: [107, 26, 23, 62, 137, 213, 131, 235],
+    init_oracle: [78, 100, 33, 183, 96, 207, 60, 91],
     lock_liquidity: [179, 201, 236, 158, 212, 98, 70, 182],
     unlock_liquidity: [154, 98, 151, 31, 8, 180, 144, 1],
+    // Protocol fees
+    claim_protocol_fees: [34, 142, 219, 112, 109, 54, 133, 23],
+    transfer_protocol_fees: [142, 148, 70, 57, 116, 166, 82, 111],
     // Staking / Rewards
     claim_holder_rewards: [79, 182, 142, 158, 108, 127, 120, 174],
     claim_nft_rewards: [155, 218, 162, 252, 207, 252, 197, 230],
     sync_holder_stake: [151, 230, 186, 138, 237, 187, 231, 155],
+    // Admin / governance
+    update_admin: [161, 176, 40, 213, 60, 184, 179, 228],
+    update_authorities: [175, 228, 137, 18, 175, 70, 220, 165],
+    update_fee_config: [104, 184, 103, 242, 88, 151, 107, 20],
+    set_pause: [63, 32, 154, 2, 56, 103, 79, 45],
+    set_pause_bits: [122, 45, 85, 156, 176, 64, 45, 83],
+    unpause_override: [150, 175, 134, 15, 132, 92, 237, 185],
+    // Global state init
+    init_holder_global_state: [21, 10, 69, 39, 195, 87, 203, 148],
+    init_nft_global_state: [126, 182, 160, 21, 28, 63, 16, 75],
+    init_user_holder_state: [49, 178, 188, 199, 246, 133, 51, 222],
+    init_user_nft_state: [175, 85, 43, 138, 194, 163, 71, 36],
+    // Read-only
+    view_farming_position: [29, 39, 65, 136, 187, 153, 243, 130],
   },
   events: {
     SwapExecuted: [150, 166, 26, 225, 28, 89, 38, 79],
@@ -394,10 +404,17 @@ const ORBIT_DISCRIMINATORS = {
     PoolInitialized: [100, 118, 173, 87, 12, 198, 254, 229],
     FeesDistributed: [209, 24, 174, 200, 236, 90, 154, 55],
     LiquidityLocked: [150, 201, 204, 183, 217, 13, 119, 185],
-    LiquidityUnlocked: [123, 220, 231, 215, 36, 204, 249, 173],
     ClaimHolderRewardsEvent: [97, 42, 168, 9, 85, 193, 87, 102],
-    ClaimNftRewardsEvent: [11, 114, 211, 206, 227, 26, 6, 26],
     SyncHolderStakeEvent: [47, 69, 233, 184, 242, 2, 125, 106],
+    // Admin / governance events
+    AdminUpdated: [69, 82, 49, 171, 43, 3, 80, 161],
+    AuthoritiesUpdated: [67, 41, 36, 180, 223, 84, 221, 76],
+    FeeConfigUpdated: [45, 50, 42, 173, 193, 67, 52, 244],
+    PauseUpdated: [203, 203, 33, 225, 130, 103, 90, 105],
+    // Setup events
+    BinArrayCreated: [124, 208, 24, 108, 92, 150, 57, 156],
+    LiquidityBinCreated: [193, 62, 251, 203, 209, 242, 92, 48],
+    PairRegistered: [125, 143, 112, 66, 5, 53, 110, 4],
   },
 };
 
@@ -420,12 +437,12 @@ function detectFromInstructionData(data) {
   const disc = Array.from(data.slice(0, 8));
   const ix = ORBIT_DISCRIMINATORS.instructions;
 
-  // Swaps (both IDL versions)
-  if (arraysEqual(disc, ix.swap) || arraysEqual(disc, ix.swap_v2)) return TX_TYPE.SWAP;
+  // Swap
+  if (arraysEqual(disc, ix.swap)) return TX_TYPE.SWAP;
   // Liquidity add (single + batch)
   if (arraysEqual(disc, ix.add_liquidity_v2) || arraysEqual(disc, ix.add_liquidity_batch)) return TX_TYPE.LP_ADD;
-  // Liquidity remove (both IDL versions)
-  if (arraysEqual(disc, ix.withdraw) || arraysEqual(disc, ix.withdraw_v2)) return TX_TYPE.LP_REMOVE;
+  // Liquidity remove
+  if (arraysEqual(disc, ix.withdraw)) return TX_TYPE.LP_REMOVE;
   // Close position (removes liquidity + closes account)
   if (arraysEqual(disc, ix.close_position)) return TX_TYPE.CLOSE_POSITION;
   // Liquidity locking/unlocking
@@ -433,10 +450,22 @@ function detectFromInstructionData(data) {
   if (arraysEqual(disc, ix.unlock_liquidity)) return TX_TYPE.UNLOCK_LIQUIDITY;
   // Pool/position management
   if (arraysEqual(disc, ix.init_pool)) return TX_TYPE.POOL_INIT;
+  if (arraysEqual(disc, ix.close_pool)) return TX_TYPE.CLOSE_POOL;
   if (arraysEqual(disc, ix.init_position)) return TX_TYPE.LP_ADD; // opening a position = preparing to add liquidity
+  // Protocol fees
+  if (arraysEqual(disc, ix.claim_protocol_fees) || arraysEqual(disc, ix.transfer_protocol_fees)) return TX_TYPE.PROTOCOL_FEES;
   // Reward claims & staking
   if (arraysEqual(disc, ix.claim_holder_rewards) || arraysEqual(disc, ix.claim_nft_rewards)) return TX_TYPE.CLAIM_REWARDS;
   if (arraysEqual(disc, ix.sync_holder_stake)) return TX_TYPE.SYNC_STAKE;
+  // Admin / governance
+  if (arraysEqual(disc, ix.update_admin) || arraysEqual(disc, ix.update_authorities) ||
+      arraysEqual(disc, ix.update_fee_config) || arraysEqual(disc, ix.set_pause) ||
+      arraysEqual(disc, ix.set_pause_bits) || arraysEqual(disc, ix.unpause_override)) return TX_TYPE.ADMIN;
+  // Setup / infrastructure
+  if (arraysEqual(disc, ix.create_bin_array) || arraysEqual(disc, ix.init_oracle) ||
+      arraysEqual(disc, ix.init_position_bin) || arraysEqual(disc, ix.init_holder_global_state) ||
+      arraysEqual(disc, ix.init_nft_global_state) || arraysEqual(disc, ix.init_user_holder_state) ||
+      arraysEqual(disc, ix.init_user_nft_state) || arraysEqual(disc, ix.view_farming_position)) return TX_TYPE.SETUP;
 
   return TX_TYPE.UNKNOWN;
 }
@@ -476,15 +505,34 @@ function detectFromLogs(logs) {
       if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.LiquidityLocked)) {
         return { type: TX_TYPE.LOCK_LIQUIDITY, eventName: 'LiquidityLocked' };
       }
-      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.LiquidityUnlocked)) {
-        return { type: TX_TYPE.UNLOCK_LIQUIDITY, eventName: 'LiquidityUnlocked' };
-      }
-      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.ClaimHolderRewardsEvent) ||
-          arraysEqual(disc, ORBIT_DISCRIMINATORS.events.ClaimNftRewardsEvent)) {
+      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.ClaimHolderRewardsEvent)) {
         return { type: TX_TYPE.CLAIM_REWARDS, eventName: 'ClaimRewards' };
       }
       if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.SyncHolderStakeEvent)) {
         return { type: TX_TYPE.SYNC_STAKE, eventName: 'SyncHolderStake' };
+      }
+      // Admin / governance events
+      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.AdminUpdated)) {
+        return { type: TX_TYPE.ADMIN, eventName: 'AdminUpdated' };
+      }
+      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.AuthoritiesUpdated)) {
+        return { type: TX_TYPE.ADMIN, eventName: 'AuthoritiesUpdated' };
+      }
+      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.FeeConfigUpdated)) {
+        return { type: TX_TYPE.ADMIN, eventName: 'FeeConfigUpdated' };
+      }
+      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.PauseUpdated)) {
+        return { type: TX_TYPE.ADMIN, eventName: 'PauseUpdated' };
+      }
+      // Setup events
+      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.BinArrayCreated)) {
+        return { type: TX_TYPE.SETUP, eventName: 'BinArrayCreated' };
+      }
+      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.LiquidityBinCreated)) {
+        return { type: TX_TYPE.SETUP, eventName: 'LiquidityBinCreated' };
+      }
+      if (arraysEqual(disc, ORBIT_DISCRIMINATORS.events.PairRegistered)) {
+        return { type: TX_TYPE.POOL_INIT, eventName: 'PairRegistered' };
       }
     } catch (e) {
       // Continue to next log
@@ -567,7 +615,28 @@ function detectTransactionType(message) {
   if (explicitType === 'init_position' || explicitType === 'initposition') {
     return { type: TX_TYPE.LP_ADD, direction: 'add', confidence: 'high' };
   }
-  
+  if (explicitType.includes('close_pool') || explicitType === 'closepool') {
+    return { type: TX_TYPE.CLOSE_POOL, direction: null, confidence: 'high' };
+  }
+  if (explicitType.includes('claim_protocol_fees') || explicitType.includes('transfer_protocol_fees')) {
+    return { type: TX_TYPE.PROTOCOL_FEES, direction: null, confidence: 'high' };
+  }
+  if (explicitType.includes('update_admin') || explicitType === 'adminupdated' ||
+      explicitType.includes('update_authorities') || explicitType === 'authoritiesupdated' ||
+      explicitType.includes('update_fee_config') || explicitType === 'feeconfigured' ||
+      explicitType === 'feeconfigupdated' || explicitType.includes('set_pause') ||
+      explicitType.includes('unpause') || explicitType === 'pauseupdated' ||
+      explicitType.includes('set_pause_bits')) {
+    return { type: TX_TYPE.ADMIN, direction: null, confidence: 'high' };
+  }
+  if (explicitType.includes('create_bin_array') || explicitType === 'binarraycreated' ||
+      explicitType.includes('init_oracle') || explicitType.includes('init_position_bin') ||
+      explicitType.includes('init_holder_global') || explicitType.includes('init_nft_global') ||
+      explicitType.includes('init_user_holder') || explicitType.includes('init_user_nft') ||
+      explicitType === 'liquiditybincreated' || explicitType.includes('view_farming')) {
+    return { type: TX_TYPE.SETUP, direction: null, confidence: 'high' };
+  }
+
   // Method 2: Instruction data discriminator (Anchor)
   if (message.instructionData || message.data) {
     const data = message.instructionData || message.data;
@@ -593,12 +662,12 @@ function detectTransactionType(message) {
 
   // Method 3: Check logs for Anchor events
   if (message.logs) {
-    const { type } = detectFromLogs(message.logs);
-    if (type !== TX_TYPE.UNKNOWN) {
-      const direction = type === TX_TYPE.SWAP ? getSwapDirection(message) :
-                       type === TX_TYPE.LP_ADD ? 'add' :
-                       type === TX_TYPE.LP_REMOVE ? 'remove' : null;
-      return { type, direction, confidence: 'high' };
+    const logResult = detectFromLogs(message.logs);
+    if (logResult.type !== TX_TYPE.UNKNOWN) {
+      const direction = logResult.type === TX_TYPE.SWAP ? getSwapDirection(message) :
+                       logResult.type === TX_TYPE.LP_ADD ? 'add' :
+                       logResult.type === TX_TYPE.LP_REMOVE ? 'remove' : null;
+      return { type: logResult.type, direction, eventName: logResult.eventName, confidence: 'high' };
     }
   }
   
@@ -708,15 +777,6 @@ function isValidMint(mint) {
   }
 }
 
-function isValidSignature(sig) {
-  try {
-    schemas.txSignature.parse(sig);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // ENHANCED FORMATTING (numeral + dayjs)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -762,34 +822,10 @@ function formatPrice(price) {
   return '$' + price.toExponential(2);
 }
 
-// Format percentages
-function formatPercent(value, decimals = 2) {
-  if (value === null || value === undefined || isNaN(value)) return '0%';
-  return numeral(value / 100).format('0.' + '0'.repeat(decimals) + '%');
-}
-
 // Format timestamps - relative time
 function timeAgo(timestamp) {
   if (!timestamp) return 'Never';
   return dayjs(timestamp).fromNow();
-}
-
-// Format timestamps - absolute time (short)
-function formatTime(timestamp) {
-  if (!timestamp) return '--:--';
-  return dayjs(timestamp).utc().format('HH:mm');
-}
-
-// Format timestamps - full date/time
-function formatDateTime(timestamp) {
-  if (!timestamp) return 'Unknown';
-  return dayjs(timestamp).utc().format('MMM D, HH:mm') + ' UTC';
-}
-
-// Format timestamps - date only
-function formatDate(timestamp) {
-  if (!timestamp) return 'Unknown';
-  return dayjs(timestamp).format('MMM D, YYYY');
 }
 
 // Get current time formatted
@@ -1418,7 +1454,6 @@ const SCRIPT_DIR = __dirname || path.dirname(process.argv[1] || '.');
 const DATA_DIR = process.env.DATA_DIR || path.join(SCRIPT_DIR, 'data');
 const DB_FILE = path.join(DATA_DIR, 'orbit-tracker.db');
 const USERS_FILE = path.join(DATA_DIR, 'users.json'); // Legacy - for migration
-const BACKUP_FILE = path.join(DATA_DIR, 'users.backup.json');
 
 // Ensure data directory exists
 function ensureDataDir() {
@@ -1476,7 +1511,10 @@ function initDatabase() {
         new_pool_alerts INTEGER DEFAULT 1,
         lock_alerts INTEGER DEFAULT 1,
         reward_alerts INTEGER DEFAULT 1,
-        
+        close_pool_alerts INTEGER DEFAULT 1,
+        protocol_fee_alerts INTEGER DEFAULT 1,
+        admin_alerts INTEGER DEFAULT 1,
+
         -- Snooze/quiet
         snoozed_until INTEGER DEFAULT 0,
         quiet_start INTEGER,
@@ -1574,6 +1612,9 @@ function initDatabase() {
       ['new_pool_alerts', 'INTEGER DEFAULT 1'],
       ['lock_alerts', 'INTEGER DEFAULT 1'],
       ['reward_alerts', 'INTEGER DEFAULT 1'],
+      ['close_pool_alerts', 'INTEGER DEFAULT 1'],
+      ['protocol_fee_alerts', 'INTEGER DEFAULT 1'],
+      ['admin_alerts', 'INTEGER DEFAULT 1'],
     ];
     for (const [col, type] of newCols) {
       try { db.exec(`ALTER TABLE users ADD COLUMN ${col} ${type}`); }
@@ -1781,10 +1822,13 @@ function dbRowToUser(row) {
     otherBuys: row.other_buys === 1,
     otherSells: row.other_sells === 1,
     otherThreshold: row.other_threshold,
-    walletAlerts: row.wallet_alerts === 1,
+    walletAlerts: row.wallet_alerts === undefined ? true : row.wallet_alerts === 1,
     newPoolAlerts: row.new_pool_alerts === undefined ? true : row.new_pool_alerts === 1,
     lockAlerts: row.lock_alerts === undefined ? true : row.lock_alerts === 1,
     rewardAlerts: row.reward_alerts === undefined ? true : row.reward_alerts === 1,
+    closePoolAlerts: row.close_pool_alerts === undefined ? true : row.close_pool_alerts === 1,
+    protocolFeeAlerts: row.protocol_fee_alerts === undefined ? true : row.protocol_fee_alerts === 1,
+    adminAlerts: row.admin_alerts === undefined ? true : row.admin_alerts === 1,
     snoozedUntil: row.snoozed_until,
     quietStart: row.quiet_start,
     quietEnd: row.quiet_end,
@@ -1817,6 +1861,7 @@ function saveUser(user) {
           track_other_pools, other_lp_add, other_lp_remove, other_lp_threshold,
           other_buys, other_sells, other_threshold,
           wallet_alerts, new_pool_alerts, lock_alerts, reward_alerts,
+          close_pool_alerts, protocol_fee_alerts, admin_alerts,
           snoozed_until, quiet_start, quiet_end, daily_digest,
           stats, today_stats, portfolio, my_wallet, created_at, last_active
         ) VALUES (
@@ -1825,6 +1870,7 @@ function saveUser(user) {
           @trackOtherPools, @otherLpAdd, @otherLpRemove, @otherLpThreshold,
           @otherBuys, @otherSells, @otherThreshold,
           @walletAlerts, @newPoolAlerts, @lockAlerts, @rewardAlerts,
+          @closePoolAlerts, @protocolFeeAlerts, @adminAlerts,
           @snoozedUntil, @quietStart, @quietEnd, @dailyDigest,
           @stats, @todayStats, @portfolio, @myWallet, @createdAt, @lastActive
         )
@@ -1841,6 +1887,9 @@ function saveUser(user) {
           wallet_alerts=excluded.wallet_alerts,
           new_pool_alerts=excluded.new_pool_alerts, lock_alerts=excluded.lock_alerts,
           reward_alerts=excluded.reward_alerts,
+          close_pool_alerts=excluded.close_pool_alerts,
+          protocol_fee_alerts=excluded.protocol_fee_alerts,
+          admin_alerts=excluded.admin_alerts,
           snoozed_until=excluded.snoozed_until,
           quiet_start=excluded.quiet_start, quiet_end=excluded.quiet_end,
           daily_digest=excluded.daily_digest,
@@ -1858,18 +1907,21 @@ function saveUser(user) {
         cipherSells: user.cipherSells ? 1 : 0,
         cipherLpAdd: user.cipherLpAdd ? 1 : 0,
         cipherLpRemove: user.cipherLpRemove ? 1 : 0,
-        cipherThreshold: user.cipherThreshold || 100,
+        cipherThreshold: user.cipherThreshold ?? 100,
         trackOtherPools: user.trackOtherPools ? 1 : 0,
         otherLpAdd: user.otherLpAdd ? 1 : 0,
         otherLpRemove: user.otherLpRemove ? 1 : 0,
-        otherLpThreshold: user.otherLpThreshold || 500,
+        otherLpThreshold: user.otherLpThreshold ?? 500,
         otherBuys: user.otherBuys ? 1 : 0,
         otherSells: user.otherSells ? 1 : 0,
-        otherThreshold: user.otherThreshold || 500,
+        otherThreshold: user.otherThreshold ?? 500,
         walletAlerts: user.walletAlerts ? 1 : 0,
         newPoolAlerts: user.newPoolAlerts !== false ? 1 : 0,
         lockAlerts: user.lockAlerts !== false ? 1 : 0,
         rewardAlerts: user.rewardAlerts !== false ? 1 : 0,
+        closePoolAlerts: user.closePoolAlerts !== false ? 1 : 0,
+        protocolFeeAlerts: user.protocolFeeAlerts !== false ? 1 : 0,
+        adminAlerts: user.adminAlerts !== false ? 1 : 0,
         snoozedUntil: user.snoozedUntil || 0,
         quietStart: user.quietStart,
         quietEnd: user.quietEnd,
@@ -1996,13 +2048,16 @@ function createUser(chatId) {
     newPoolAlerts: true,
     lockAlerts: true,
     rewardAlerts: true,
+    closePoolAlerts: true,
+    protocolFeeAlerts: true,
+    adminAlerts: true,
     snoozedUntil: 0,
     quietStart: null,
     quietEnd: null,
     dailyDigest: false,
     recentAlerts: [],
-    todayStats: { trades: 0, lp: 0, wallet: 0, lastReset: Date.now() },
-    stats: { cipherBuys: 0, cipherSells: 0, cipherLp: 0, otherLp: 0, otherTrades: 0, walletAlerts: 0, volume: 0 },
+    todayStats: { trades: 0, lp: 0, wallet: 0, events: 0, lastReset: Date.now() },
+    stats: { cipherBuys: 0, cipherSells: 0, cipherLp: 0, otherLp: 0, otherTrades: 0, walletAlerts: 0, events: 0, volume: 0 },
     createdAt: Date.now(),
     lastActive: Date.now(),
     portfolioWallets: [],
@@ -2053,9 +2108,9 @@ function addRecentAlert(chatId, alert) {
   const today = new Date().toDateString();
   const lastReset = new Date(user.todayStats?.lastReset || 0).toDateString();
   if (today !== lastReset) {
-    user.todayStats = { trades: 0, lp: 0, wallet: 0, lastReset: Date.now() };
+    user.todayStats = { trades: 0, lp: 0, wallet: 0, events: 0, lastReset: Date.now() };
   }
-  
+
   // Save to database
   if (db) {
     try {
@@ -2103,6 +2158,7 @@ function isQuietHoursActive(user) {
   }
 }
 
+
 function getAllTrackedWallets() {
   const wallets = new Set();
   for (const user of users.values()) {
@@ -2141,43 +2197,6 @@ async function checkOrbitHealth() {
     updateApiHealth('orbit', false);
     return false;
   }
-}
-
-// Check all SDK connections
-async function checkSdkHealth() {
-  const status = {
-    heliusSdk: false,
-    solanaRpc: false,
-    solanaBackup: false,
-  };
-  
-  // Check Helius SDK
-  if (helius) {
-    try {
-      await helius.rpc.getLatestBlockhash();
-      status.heliusSdk = true;
-    } catch (e) {
-      log.debug('Helius SDK health check failed:', e.message);
-    }
-  }
-  
-  // Check primary Solana connection
-  try {
-    await solanaConnection.getSlot();
-    status.solanaRpc = true;
-  } catch (e) {
-    log.debug('Primary Solana RPC health check failed:', e.message);
-  }
-  
-  // Check backup connection
-  try {
-    await solanaBackupConnection.getSlot();
-    status.solanaBackup = true;
-  } catch (e) {
-    log.debug('Backup Solana RPC health check failed:', e.message);
-  }
-  
-  return status;
 }
 
 async function fetchPools() {
@@ -3024,24 +3043,6 @@ async function fetchStreamflowLockedAmount() {
   }
 }
 
-// Alternative: Fetch from Birdeye token security endpoint (has holder distribution)
-async function fetchTokenSecurityData() {
-  try {
-    const res = await birdeyeFetch(BIRDEYE.security(MINTS.CIPHER));
-    const data = await res.json();
-    
-    if (data?.success && data?.data) {
-      return {
-        topHolders: data.data.top10HolderPercent,
-        lockInfo: data.data.lockInfo,
-      };
-    }
-    return null;
-  } catch (e) {
-    return null;
-  }
-}
-
 // Fetch token supply from Solana RPC
 async function fetchTokenSupply(mint) {
   try {
@@ -3489,17 +3490,6 @@ function getPoolAge(pool) {
   return `${days}d ago`;
 }
 
-// Get pools with highest volume increase (gainers)
-function getTopGainers(limit = 10) {
-  return getSortedPools('volume').slice(0, limit);
-}
-
-// Get recent large trades across all pools
-function getRecentLargeTrades(minUsd = 1000, limit = 10) {
-  // This would need trade history tracking - for now return empty
-  return [];
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // BIRDEYE ENHANCED DATA
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3622,29 +3612,6 @@ async function fetchTokenSecurity(mint) {
   }
 }
 
-// Get top traders for a token
-async function fetchTopTraders(mint) {
-  if (!mint) return [];
-  
-  try {
-    const res = await birdeyeFetch(BIRDEYE.topTraders(mint));
-    const data = await res.json();
-    
-    if (!data?.success || !data?.data?.items) {
-      return [];
-    }
-    
-    return data.data.items.slice(0, 5).map(t => ({
-      wallet: t.wallet,
-      pnl: t.pnl,
-      volume: t.volume,
-      trades: t.trade,
-    }));
-  } catch (e) {
-    return [];
-  }
-}
-
 // Cache for token overviews (don't fetch too often)
 const tokenOverviewCache = new Map();
 const TOKEN_OVERVIEW_TTL = 60000; // 1 minute cache
@@ -3751,7 +3718,7 @@ async function fetchOrbitLeaderboard(poolId, limit = 10) {
       const totalPnl = realizedPnl + (unrealizedValue - remainingCostBasis);
       
       const totalVolume = stats.buyVolume + stats.sellVolume;
-      const pnlPercent = totalVolume > 0 ? (totalPnl / stats.buyVolume) * 100 : 0;
+      const pnlPercent = stats.buyVolume > 0 ? (totalPnl / stats.buyVolume) * 100 : 0;
       
       return {
         wallet: stats.wallet,
@@ -3825,7 +3792,7 @@ function formatLeaderboardMessage(data) {
   
   let msg = `🏆 *ORBIT DLMM LEADERBOARD*\n`;
   msg += `━━━━━━━━━━━━━━━━━━━━━\n`;
-  msg += `📊 *${symbol}*`;
+  msg += `📊 *${escMd(symbol)}*`;
   if (pool) {
     const price = getPrice(pool.baseMint);
     if (price) msg += ` • ${fmtPrice(price)}`;
@@ -3958,127 +3925,6 @@ async function generatePriceChart(candles, symbol, timeframe = '1h') {
   }
 }
 
-// Generate candlestick chart (more detailed)
-async function generateCandlestickChart(candles, symbol, timeframe = '1h') {
-  if (!candles || candles.length < 2) return null;
-  
-  try {
-    const renderer = getChartRenderer();
-    const labels = candles.map(c => {
-      const d = dayjs(c.time * 1000);
-      return timeframe.includes('d') ? d.format('MMM D') : d.format('HH:mm');
-    });
-    
-    // For candlestick-like visualization, use bar chart with colors
-    const colors = candles.map(c => c.close >= c.open ? '#00ff88' : '#ff4444');
-    const barData = candles.map(c => Math.abs(c.close - c.open));
-    
-    const config = {
-      type: 'bar',
-      data: {
-        labels,
-        datasets: [
-          {
-            label: 'Price Range',
-            data: barData,
-            backgroundColor: colors,
-            borderColor: colors,
-            borderWidth: 1,
-          }
-        ]
-      },
-      options: {
-        responsive: false,
-        plugins: {
-          legend: { display: false },
-          title: {
-            display: true,
-            text: `${symbol} Candles • ${timeframe.toUpperCase()}`,
-            color: '#ffffff',
-            font: { size: 16, weight: 'bold' }
-          }
-        },
-        scales: {
-          x: {
-            grid: { color: 'rgba(255,255,255,0.1)' },
-            ticks: { color: '#888', maxTicksLimit: 8 }
-          },
-          y: {
-            grid: { color: 'rgba(255,255,255,0.1)' },
-            ticks: { color: '#888' }
-          }
-        }
-      }
-    };
-    
-    const buffer = await renderer.renderToBuffer(config);
-    return buffer;
-  } catch (e) {
-    log.error('Candlestick chart error:', e.message);
-    return null;
-  }
-}
-
-// Generate portfolio pie chart
-async function generatePortfolioChart(holdings) {
-  if (!holdings || holdings.length === 0) return null;
-  
-  try {
-    const renderer = getChartRenderer();
-    // Top 6 holdings + "Other"
-    const sorted = [...holdings].sort((a, b) => b.valueUsd - a.valueUsd);
-    const top = sorted.slice(0, 6);
-    const other = sorted.slice(6).reduce((sum, h) => sum + h.valueUsd, 0);
-    
-    const labels = top.map(h => h.symbol || 'Unknown');
-    const data = top.map(h => h.valueUsd);
-    
-    if (other > 0) {
-      labels.push('Other');
-      data.push(other);
-    }
-    
-    const colors = [
-      '#00ff88', '#3498db', '#e74c3c', '#f39c12', 
-      '#9b59b6', '#1abc9c', '#95a5a6'
-    ];
-    
-    const config = {
-      type: 'doughnut',
-      data: {
-        labels,
-        datasets: [{
-          data,
-          backgroundColor: colors.slice(0, data.length),
-          borderColor: '#1a1a2e',
-          borderWidth: 2,
-        }]
-      },
-      options: {
-        responsive: false,
-        plugins: {
-          legend: {
-            position: 'right',
-            labels: { color: '#ffffff', font: { size: 12 } }
-          },
-          title: {
-            display: true,
-            text: 'Portfolio Distribution',
-            color: '#ffffff',
-            font: { size: 16, weight: 'bold' }
-          }
-        }
-      }
-    };
-    
-    const buffer = await renderer.renderToBuffer(config);
-    return buffer;
-  } catch (e) {
-    log.error('Portfolio chart error:', e.message);
-    return null;
-  }
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // ENHANCED LIQUIDITY TRACKING
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -4112,12 +3958,12 @@ function formatLiquidityHistory(poolId) {
   const events = getLiquidityHistory(poolId);
   
   if (events.length === 0) {
-    return `💧 *Liquidity History*\n\n*${pool.pairName}*\n\n_No recent liquidity events_`;
+    return `💧 *Liquidity History*\n\n*${escMd(pool.pairName)}*\n\n_No recent liquidity events_`;
   }
   
   let msg = `💧 *Liquidity History*\n`;
   msg += `━━━━━━━━━━━━━━━━━━━━━\n`;
-  msg += `*${pool.pairName}*\n\n`;
+  msg += `*${escMd(pool.pairName)}*\n\n`;
   
   events.forEach(e => {
     const icon = e.isAdd ? '🟢 ADD' : '🔴 REMOVE';
@@ -4133,6 +3979,9 @@ function formatLiquidityHistory(poolId) {
 // ═══════════════════════════════════════════════════════════════════════════════
 let orbitWs = null;
 let orbitWsRunning = false;
+const activeIntervals = [];
+const activeCronJobs = [];
+let healthServer = null;
 const seenTxs = new Set();
 let orbitWsReconnectAttempts = 0;
 let orbitWsPingInterval = null;
@@ -4304,6 +4153,29 @@ function handleOrbitMessage(msg) {
       log.info(`🔄 Stake Sync [${sig?.slice(0,8) || 'no-sig'}...] conf:${detection.confidence}`);
       if (sig) { seenTxs.add(sig); persistSeenTx(sig); }
       break;
+
+    case TX_TYPE.CLOSE_POOL:
+      log.info(`🚫 Pool Closed [${sig?.slice(0,8) || 'no-sig'}...] conf:${detection.confidence}`);
+      if (sig) { seenTxs.add(sig); persistSeenTx(sig); }
+      broadcastClosePoolAlert({ poolId, user, sig, timestamp }).catch(e => log.debug('Close pool alert failed:', e.message));
+      break;
+
+    case TX_TYPE.PROTOCOL_FEES:
+      log.info(`💰 Protocol Fees [${sig?.slice(0,8) || 'no-sig'}...] conf:${detection.confidence}`);
+      if (sig) { seenTxs.add(sig); persistSeenTx(sig); }
+      broadcastProtocolFeeAlert({ poolId, user, sig, timestamp }).catch(e => log.debug('Protocol fee alert failed:', e.message));
+      break;
+
+    case TX_TYPE.ADMIN:
+      log.info(`⚠️ Admin Action [${sig?.slice(0,8) || 'no-sig'}...] conf:${detection.confidence}`);
+      if (sig) { seenTxs.add(sig); persistSeenTx(sig); }
+      broadcastAdminAlert({ poolId, user, sig, timestamp, eventName: detection.eventName }).catch(e => log.debug('Admin alert failed:', e.message));
+      break;
+
+    case TX_TYPE.SETUP:
+      log.info(`🔧 Setup [${sig?.slice(0,8) || 'no-sig'}...] conf:${detection.confidence}`);
+      if (sig) { seenTxs.add(sig); persistSeenTx(sig); }
+      break; // dedup only, no user alert
   }
 }
 
@@ -5183,6 +5055,9 @@ const menu = {
         else if (a.type === 'lock') icon = '🔒';
         else if (a.type === 'unlock') icon = '🔓';
         else if (a.type === 'reward') icon = '🎁';
+        else if (a.type === 'close_pool') icon = '🚫';
+        else if (a.type === 'protocol_fees') icon = '💰';
+        else if (a.type === 'admin') icon = '⚠️';
         const time = new Date(a.time).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC' });
         const label = a.pair || a.token || a.wallet || '???';
         if (a.sig) {
@@ -5204,7 +5079,10 @@ const menu = {
     [Markup.button.callback(u?.newPoolAlerts !== false ? '🆕 New Pools: ON' : '🆕 New Pools: OFF', 'tog:newPoolAlerts'),
      Markup.button.callback(u?.lockAlerts !== false ? '🔒 Lock: ON' : '🔒 Lock: OFF', 'tog:lockAlerts')],
     [Markup.button.callback(u?.rewardAlerts !== false ? '🎁 Rewards: ON' : '🎁 Rewards: OFF', 'tog:rewardAlerts'),
-     Markup.button.callback(u?.dailyDigest ? '📬 Digest: ON' : '📭 Digest: OFF', 'tog:dailyDigest')],
+     Markup.button.callback(u?.closePoolAlerts !== false ? '🚫 Close Pool: ON' : '🚫 Close Pool: OFF', 'tog:closePoolAlerts')],
+    [Markup.button.callback(u?.protocolFeeAlerts !== false ? '💰 Fees: ON' : '💰 Fees: OFF', 'tog:protocolFeeAlerts'),
+     Markup.button.callback(u?.adminAlerts !== false ? '⚠️ Admin: ON' : '⚠️ Admin: OFF', 'tog:adminAlerts')],
+    [Markup.button.callback(u?.dailyDigest ? '📬 Digest: ON' : '📭 Digest: OFF', 'tog:dailyDigest')],
     [Markup.button.callback('🗑️ Reset Statistics', 'confirm:resetstats'), Markup.button.callback('❓ Help', 'info:help')],
     [Markup.button.callback('🏠 Menu', 'nav:main')],
   ]),
@@ -5404,7 +5282,7 @@ const menu = {
     
     const btns = pageTrades.map(t => {
       const icon = t.side === 'buy' ? '🟢' : '🔴';
-      const time = new Date(t.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      const time = new Date(t.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
       return [Markup.button.url(`${icon} ${t.pool} • ${fmt(t.usd)} • ${time}`, `https://solscan.io/tx/${t.sig}`)];
     });
     
@@ -5523,6 +5401,7 @@ _No wallet connection required. Read-only. Safe._`,
 /pause — Pause all alerts
 /resume — Resume alerts
 /snooze — Snooze for 1 hour
+/settings — Pool close, protocol fee, admin alerts
 
 *Settings:*
 /settings — Alert preferences
@@ -5654,7 +5533,7 @@ _Tap a pool for details, charts, and leaderboards._`;
       if (parts.length > 0) feeStr += ` (${parts.join(' · ')})`;
     }
 
-    return `${icon} *${pairName}*
+    return `${icon} *${escMd(pairName)}*
 
 💵 *Price:* ${priceStr}
 📊 *24h Volume:* ${fmtCompact(vol24h)}
@@ -5739,6 +5618,9 @@ Your last ${count} alert${count !== 1 ? 's' : ''}. Tap to view on Solscan.`;
 *New Pools:* ${u?.newPoolAlerts !== false ? '🆕 ON' : 'OFF'}
 *Lock/Unlock:* ${u?.lockAlerts !== false ? '🔒 ON' : 'OFF'}
 *Rewards:* ${u?.rewardAlerts !== false ? '🎁 ON' : 'OFF'}
+*Close Pool:* ${u?.closePoolAlerts !== false ? '🚫 ON' : 'OFF'}
+*Protocol Fees:* ${u?.protocolFeeAlerts !== false ? '💰 ON' : 'OFF'}
+*Admin:* ${u?.adminAlerts !== false ? '⚠️ ON' : 'OFF'}
 
 *Tracked:*
 • ${u?.wallets?.length || 0} whale wallets
@@ -5927,7 +5809,7 @@ _${lastSync} UTC_`;
         const usd = parseFloat(token.totalUsd) || 0;
         if (usd >= 1) {
           const symbol = token.symbol || '???';
-          topTokensText += `• ${symbol}: ${fmt(usd)}\n`;
+          topTokensText += `• ${escMd(symbol)}: ${fmt(usd)}\n`;
         }
       }
     }
@@ -6003,7 +5885,7 @@ _Tap Refresh to sync, or check /status for API health._`;
       const valueStr = usd >= 1 ? fmt(usd) : usd > 0 ? '<$1' : '$0';
       const priceStr = price > 0 ? ` @ ${fmtPrice(price)}` : '';
       
-      list += `• *${symbol}*: ${balanceStr} (${valueStr})${priceStr}\n`;
+      list += `• *${escMd(symbol)}*: ${balanceStr} (${valueStr})${priceStr}\n`;
     }
     
     if (tokens.length > 15) {
@@ -6099,7 +5981,9 @@ bot.command('menu', async (ctx) => {
 });
 
 bot.command('status', async (ctx) => {
-  try { await ctx.reply(text.status(), { parse_mode: 'Markdown' }); } catch (e) {
+  try {
+    await ctx.reply(text.status(), { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
+  } catch (e) {
     try { await ctx.reply('❌ Failed to load status.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) }); } catch (e2) {}
   }
 });
@@ -6107,7 +5991,7 @@ bot.command('status', async (ctx) => {
 bot.command('pause', async (ctx) => {
   try {
     updateUser(ctx.chat.id, { enabled: false });
-    await ctx.reply('⏸️ Alerts paused. Use /resume to turn back on.');
+    await ctx.reply('⏸️ Alerts paused. Use /resume to turn back on.', { ...Markup.inlineKeyboard([[Markup.button.callback('▶️ Resume', 'tog:enabled'), Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   } catch (e) {
     try { await ctx.reply('❌ Failed to pause alerts.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) }); } catch (e2) {}
   }
@@ -6116,7 +6000,7 @@ bot.command('pause', async (ctx) => {
 bot.command('resume', async (ctx) => {
   try {
     updateUser(ctx.chat.id, { enabled: true, snoozedUntil: 0 });
-    await ctx.reply('▶️ Alerts resumed!');
+    await ctx.reply('▶️ Alerts resumed!', { ...Markup.inlineKeyboard([[Markup.button.callback('⚙️ Settings', 'nav:settings'), Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   } catch (e) {
     try { await ctx.reply('❌ Failed to resume alerts.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) }); } catch (e2) {}
   }
@@ -6127,7 +6011,7 @@ bot.command('snooze', async (ctx) => {
     const user = getUser(ctx.chat.id);
     if (user) {
       updateUser(ctx.chat.id, { snoozedUntil: Date.now() + 3600000 });
-      await ctx.reply('🔕 Snoozed for 1 hour. Use /resume to turn back on.');
+      await ctx.reply('🔕 Snoozed for 1 hour. Use /resume to turn back on.', { ...Markup.inlineKeyboard([[Markup.button.callback('🔔 Unsnooze', 'snooze:off'), Markup.button.callback('🏠 Menu', 'nav:main')]]) });
     }
   } catch (e) {
     try { await ctx.reply('❌ Failed to snooze.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) }); } catch (e2) {}
@@ -6299,7 +6183,7 @@ bot.command('pnl', async (ctx) => {
     const realizedPnl = p.realizedPnl || 0;
     const unrealizedPnl = p.unrealizedPnl || 0;
     const totalPnl = realizedPnl + unrealizedPnl;
-    const pnlPercent = p.totalVolume > 0 ? ((realizedPnl / p.totalVolume) * 100).toFixed(1) : 0;
+    const pnlPercent = p.totalVolume > 0 ? ((realizedPnl / p.totalVolume) * 100).toFixed(1) : '0.0';
     
     const pnlIcon = totalPnl >= 0 ? '🟢' : '🔴';
     const realIcon = realizedPnl >= 0 ? '🟢' : '🔴';
@@ -6391,7 +6275,7 @@ bot.command('newpools', async (ctx) => {
   try {
     const newPools = getNewPools(48); // Pools added in last 48 hours
     if (newPools.length === 0) {
-      await ctx.reply('📭 *No new pools*\n\nNo new pools have been added in the last 48 hours.', { parse_mode: 'Markdown' });
+      await ctx.reply('📭 *No new pools*\n\nNo new pools have been added in the last 48 hours.', { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('🔄 Browse Pools', 'nav:pools'), Markup.button.callback('🏠 Menu', 'nav:main')]]) });
       return;
     }
     
@@ -6438,16 +6322,17 @@ bot.command('stats', async (ctx) => {
     const now = new Date();
     const lastReset = new Date(t.lastReset || 0);
     if (now.toDateString() !== lastReset.toDateString()) {
-      user.todayStats = { trades: 0, lp: 0, wallet: 0, lastReset: Date.now() };
+      user.todayStats = { trades: 0, lp: 0, wallet: 0, events: 0, lastReset: Date.now() };
       saveUsersDebounced();  // Debounced for performance
     }
-    
+
     const msg = `📊 *Your Statistics*
 
 *Today:*
 ├ Trades: ${t.trades || 0}
 ├ LP Events: ${t.lp || 0}
-└ Wallet Alerts: ${t.wallet || 0}
+├ Wallet Alerts: ${t.wallet || 0}
+└ Event Alerts: ${t.events || 0}
 
 *All Time:*
 ├ 🔷 CIPHER Buys: ${s.cipherBuys || 0}
@@ -6456,9 +6341,10 @@ bot.command('stats', async (ctx) => {
 ├ 🌐 Other Trades: ${s.otherTrades || 0}
 ├ 🌐 Other LP: ${s.otherLp || 0}
 ├ 🐋 Wallet Alerts: ${s.walletAlerts || 0}
+├ 🔔 Events: ${s.events || 0}
 └ 💰 Volume Tracked: ${fmt(s.volume || 0)}
 
-_Member since: ${new Date(user.createdAt || Date.now()).toLocaleDateString()}_`;
+_Member since: ${new Date(user.createdAt || Date.now()).toLocaleDateString('en-US', { timeZone: 'UTC' })}_`;
 
     await ctx.reply(msg, { 
       parse_mode: 'Markdown',
@@ -6509,7 +6395,7 @@ bot.command('leaderboard', async (ctx) => {
           mint = found[0];
           symbol = found[1].symbol;
         } else {
-          return await ctx.reply(`❌ Unknown token: ${mintOrSymbol}\n\nUsage: \`/leaderboard [token]\`\nExamples:\n• /leaderboard\n• /leaderboard CIPHER\n• /leaderboard SOL`, { parse_mode: 'Markdown' });
+          return await ctx.reply(`❌ Unknown token: ${escMd(mintOrSymbol)}\n\nUsage: \`/leaderboard [token]\`\nExamples:\n• /leaderboard\n• /leaderboard CIPHER\n• /leaderboard SOL`, { parse_mode: 'Markdown' });
         }
       }
     }
@@ -6605,15 +6491,30 @@ bot.command('chart', async (ctx) => {
     // Fetch candle data
     const candles = await fetchOHLCVData(pool.id, tf, 48);
     
+    const baseMint = pool.baseMint || pool.base;
+
     if (candles.length < 2) {
-      return await ctx.reply(`❌ Not enough data for ${symbol} chart.\n\nTry a different pool or timeframe.`);
+      try { await ctx.telegram.deleteMessage(ctx.chat.id, chartLoadingMsg.message_id); } catch (e) {}
+      return await ctx.reply(`❌ Not enough data for ${escMd(symbol)} chart.`, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('📊 View on DexScreener', `https://dexscreener.com/solana/${baseMint}`)],
+          [Markup.button.callback('🏠 Menu', 'nav:main')]
+        ])
+      });
     }
-    
+
     // Generate chart image
     const chartBuffer = await generatePriceChart(candles, symbol, tf);
-    
+
     if (!chartBuffer) {
-      return await ctx.reply('❌ Failed to generate chart.');
+      try { await ctx.telegram.deleteMessage(ctx.chat.id, chartLoadingMsg.message_id); } catch (e) {}
+      return await ctx.reply('❌ Failed to generate chart.', {
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('📊 View on DexScreener', `https://dexscreener.com/solana/${baseMint}`)],
+          [Markup.button.callback('🏠 Menu', 'nav:main')]
+        ])
+      });
     }
     
     // Calculate stats
@@ -6624,7 +6525,7 @@ bot.command('chart', async (ctx) => {
     const low = Math.min(...candles.map(c => c.low));
     const volume = candles.reduce((sum, c) => sum + c.volume, 0);
     
-    const caption = `📊 *${symbol}* • ${tf.toUpperCase()}
+    const caption = `📊 *${escMd(symbol)}* • ${tf.toUpperCase()}
 
 💰 *Price:* ${fmtPrice(lastPrice)}
 ${change >= 0 ? '📈' : '📉'} *Change:* ${change >= 0 ? '+' : ''}${change.toFixed(2)}%
@@ -6650,19 +6551,23 @@ _${candles.length} candles • Updated ${fmtTime()} UTC_`;
             Markup.button.callback('1D', `chart:${pool.id}:1d`),
           ],
           [Markup.button.callback('🔄 Refresh', `chart:${pool.id}:${tf}`)],
-          [Markup.button.callback('🏆 Leaderboard', `leaderboard:${pool.baseMint}`)],
+          [Markup.button.callback('🏆 Leaderboard', `leaderboard:${baseMint}`)],
+          [Markup.button.url('📊 DexScreener', `https://dexscreener.com/solana/${baseMint}`)],
         ])
       }
     );
 
   } catch (e) {
     log.error('Chart command error:', e);
-    await ctx.reply('❌ Failed to generate chart.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
+    const fallbackBtns = pool
+      ? [[Markup.button.url('📊 View on DexScreener', `https://dexscreener.com/solana/${pool.baseMint || pool.base}`)], [Markup.button.callback('🏠 Menu', 'nav:main')]]
+      : [[Markup.button.callback('🏠 Menu', 'nav:main')]];
+    await ctx.reply('❌ Failed to generate chart.', { ...Markup.inlineKeyboard(fallbackBtns) });
   }
 });
 
 // Chart action (timeframe switching)
-bot.action(/^chart:(.+):(.+)$/, async (ctx) => {
+bot.action(/^chart:(.+):(15m|1h|4h|1d)$/, async (ctx) => {
   await safeAnswer(ctx, '📊 Loading...');
   
   try {
@@ -6675,36 +6580,47 @@ bot.action(/^chart:(.+):(.+)$/, async (ctx) => {
     }
     
     const symbol = pool.pairName;
+    const baseMint = pool.baseMint || pool.base;
     const candles = await fetchOHLCVData(poolId, tf, 48);
-    
+
     if (candles.length < 2) {
-      return await ctx.reply(`❌ Not enough data for ${tf} chart.`);
+      return await ctx.reply(`❌ Not enough data for ${tf} chart.`, {
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('📊 View on DexScreener', `https://dexscreener.com/solana/${baseMint}`)],
+          [Markup.button.callback('🏠 Menu', 'nav:main')]
+        ])
+      });
     }
-    
+
     const chartBuffer = await generatePriceChart(candles, symbol, tf);
-    
+
     if (!chartBuffer) {
-      return await ctx.reply('❌ Failed to generate chart.');
+      return await ctx.reply('❌ Failed to generate chart.', {
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('📊 View on DexScreener', `https://dexscreener.com/solana/${baseMint}`)],
+          [Markup.button.callback('🏠 Menu', 'nav:main')]
+        ])
+      });
     }
-    
+
     const firstPrice = candles[0].close;
     const lastPrice = candles[candles.length - 1].close;
     const change = firstPrice > 0 ? ((lastPrice - firstPrice) / firstPrice) * 100 : 0;
     const high = Math.max(...candles.map(c => c.high));
     const low = Math.min(...candles.map(c => c.low));
-    
-    const caption = `📊 *${symbol}* • ${tf.toUpperCase()}
+
+    const caption = `📊 *${escMd(symbol)}* • ${tf.toUpperCase()}
 
 💰 *Price:* ${fmtPrice(lastPrice)}
 ${change >= 0 ? '📈' : '📉'} *Change:* ${change >= 0 ? '+' : ''}${change.toFixed(2)}%
 📈 *High:* ${fmtPrice(high)} • 📉 *Low:* ${fmtPrice(low)}
 
 _Updated ${fmtTime()} UTC_`;
-    
+
     // Send new photo (can't edit photo)
     await ctx.replyWithPhoto(
       { source: chartBuffer },
-      { 
+      {
         caption,
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([
@@ -6715,6 +6631,7 @@ _Updated ${fmtTime()} UTC_`;
             Markup.button.callback('1D', `chart:${poolId}:1d`),
           ],
           [Markup.button.callback('🔄 Refresh', `chart:${poolId}:${tf}`)],
+          [Markup.button.url('📊 DexScreener', `https://dexscreener.com/solana/${baseMint}`)],
         ])
       }
     );
@@ -6734,30 +6651,47 @@ bot.action(/^chart:([1-9A-HJ-NP-Za-km-z]{32,44})$/, async (ctx) => {
     // Find a pool with this token
     const pool = pools.find(p => p.baseMint === mint || p.quoteMint === mint);
     
+    const dexUrl = `https://dexscreener.com/solana/${mint}`;
+
     if (!pool) {
-      return await ctx.reply('❌ No pool found for this token.');
+      return await ctx.reply('❌ No pool found for this token.', {
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('📊 View on DexScreener', dexUrl)],
+          [Markup.button.callback('🏠 Menu', 'nav:main')]
+        ])
+      });
     }
-    
+
     const symbol = pool.pairName;
     const tf = '1h';
     const candles = await fetchOHLCVData(pool.id, tf, 48);
-    
+
     if (candles.length < 2) {
-      return await ctx.reply('❌ Not enough chart data available.');
+      return await ctx.reply('❌ Not enough chart data available.', {
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('📊 View on DexScreener', dexUrl)],
+          [Markup.button.callback('🏠 Menu', 'nav:main')]
+        ])
+      });
     }
-    
+
     const chartBuffer = await generatePriceChart(candles, symbol, tf);
-    
+
     if (!chartBuffer) {
-      return await ctx.reply('❌ Failed to generate chart.');
+      return await ctx.reply('❌ Failed to generate chart.', {
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('📊 View on DexScreener', dexUrl)],
+          [Markup.button.callback('🏠 Menu', 'nav:main')]
+        ])
+      });
     }
-    
+
     const lastPrice = candles[candles.length - 1].close;
-    
+
     await ctx.replyWithPhoto(
       { source: chartBuffer },
-      { 
-        caption: `📊 *${symbol}* • 1H\n\n💰 Price: ${fmtPrice(lastPrice)}`,
+      {
+        caption: `📊 *${escMd(symbol)}* • 1H\n\n💰 Price: ${fmtPrice(lastPrice)}`,
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([
           [
@@ -6766,6 +6700,7 @@ bot.action(/^chart:([1-9A-HJ-NP-Za-km-z]{32,44})$/, async (ctx) => {
             Markup.button.callback('4H', `chart:${pool.id}:4h`),
             Markup.button.callback('1D', `chart:${pool.id}:1d`),
           ],
+          [Markup.button.url('📊 DexScreener', dexUrl)],
         ])
       }
     );
@@ -6841,34 +6776,51 @@ bot.action(/^liqhistory:(.+)$/, async (ctx) => {
 // Shortcut actions for CIPHER
 bot.action('chart:cipher', async (ctx) => {
   await safeAnswer(ctx, '📊 Loading CIPHER chart...');
-  
+
+  const dexUrl = `https://dexscreener.com/solana/${MINTS.CIPHER}`;
+
   try {
     const pool = cipherPools[0];
     if (!pool) {
-      return await ctx.reply('❌ No CIPHER pools found.');
+      return await ctx.reply('❌ No CIPHER pools found.', {
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('📊 View on DexScreener', dexUrl)],
+          [Markup.button.callback('🏠 Menu', 'nav:main')]
+        ])
+      });
     }
-    
+
     const tf = '1h';
     const candles = await fetchOHLCVData(pool.id, tf, 48);
-    
+
     if (candles.length < 2) {
-      return await ctx.reply('❌ Not enough chart data available.');
+      return await ctx.reply('❌ Not enough chart data available.', {
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('📊 View on DexScreener', dexUrl)],
+          [Markup.button.callback('🏠 Menu', 'nav:main')]
+        ])
+      });
     }
-    
+
     const chartBuffer = await generatePriceChart(candles, pool.pairName, tf);
-    
+
     if (!chartBuffer) {
-      return await ctx.reply('❌ Failed to generate chart.');
+      return await ctx.reply('❌ Failed to generate chart.', {
+        ...Markup.inlineKeyboard([
+          [Markup.button.url('📊 View on DexScreener', dexUrl)],
+          [Markup.button.callback('🏠 Menu', 'nav:main')]
+        ])
+      });
     }
-    
+
     const firstPrice = candles[0].close;
     const lastPrice = candles[candles.length - 1].close;
     const change = firstPrice > 0 ? ((lastPrice - firstPrice) / firstPrice) * 100 : 0;
-    
+
     await ctx.replyWithPhoto(
       { source: chartBuffer },
-      { 
-        caption: `📊 *${pool.pairName}* • 1H\n\n💰 *Price:* ${fmtPrice(lastPrice)}\n${change >= 0 ? '📈' : '📉'} *Change:* ${change >= 0 ? '+' : ''}${change.toFixed(2)}%`,
+      {
+        caption: `📊 *${escMd(pool.pairName)}* • 1H\n\n💰 *Price:* ${fmtPrice(lastPrice)}\n${change >= 0 ? '📈' : '📉'} *Change:* ${change >= 0 ? '+' : ''}${change.toFixed(2)}%`,
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([
           [
@@ -6878,12 +6830,18 @@ bot.action('chart:cipher', async (ctx) => {
             Markup.button.callback('1D', `chart:${pool.id}:1d`),
           ],
           [Markup.button.callback('🏆 Leaderboard', `leaderboard:${MINTS.CIPHER}`)],
+          [Markup.button.url('📊 DexScreener', dexUrl)],
         ])
       }
     );
   } catch (e) {
     log.error('Chart cipher shortcut error:', e);
-    await ctx.reply('❌ Failed to generate chart.');
+    await ctx.reply('❌ Failed to generate chart.', {
+      ...Markup.inlineKeyboard([
+        [Markup.button.url('📊 View on DexScreener', dexUrl)],
+        [Markup.button.callback('🏠 Menu', 'nav:main')]
+      ])
+    });
   }
 });
 
@@ -6974,7 +6932,7 @@ bot.action('nav:allwallets', async (ctx) => {
     Markup.button.callback(`👛 ${shortAddr(w)}`, `view:wallet:${w}`),
     Markup.button.callback('🗑️', `confirm:rmwhale:${w}`),
   ]);
-  btns.push([Markup.button.callback('« Back', 'nav:wallets')]);
+  btns.push([Markup.button.callback('« Back', 'nav:wallets'), Markup.button.callback('🏠 Menu', 'nav:main')]);
   await safeEdit(ctx, `👛 *All Whale Wallets* (${wallets.length})`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(btns) });
 });
 
@@ -7122,7 +7080,7 @@ bot.action('nav:allwatchlist', async (ctx) => {
     ]);
   });
 
-  btns.push([Markup.button.callback('« Back', 'nav:watchlist')]);
+  btns.push([Markup.button.callback('« Back', 'nav:watchlist'), Markup.button.callback('🏠 Menu', 'nav:main')]);
   const total = (user?.trackedTokens?.length || 0) + (user?.watchlist?.length || 0);
   await safeEdit(ctx, `⭐ *All Watchlist Items* (${total})`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(btns) });
 });
@@ -7210,7 +7168,7 @@ bot.action('portfolio:tokens', async (ctx) => {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [Markup.button.callback('🔄 Refresh', 'portfolio:sync')],
-      [Markup.button.callback('« Back', 'nav:portfolio')],
+      [Markup.button.callback('« Back', 'nav:portfolio'), Markup.button.callback('🏠 Menu', 'nav:main')],
     ])
   });
 });
@@ -7363,7 +7321,7 @@ bot.action(/^confirm:rmwallet:(.+)$/, async (ctx) => {
   if (user.portfolioWallets.length > 0 || user.myWallet) {
     await syncPortfolio(ctx.chat.id);
   } else {
-    user.portfolio = { trades: [], lpPositions: [], lastSync: 0 };
+    user.portfolio = { trades: [], lpPositions: [], tokens: [], totalVolume: 0, realizedPnl: 0, unrealizedPnl: 0, totalValue: 0, tradeCount: 0, buyCount: 0, sellCount: 0, solBalance: 0, tokenCount: 0, walletData: {}, lastSync: 0 };
     saveUsersDebounced();  // Debounced for performance
   }
   
@@ -7409,15 +7367,6 @@ ${pnlIcon} PnL: ${pnlSign}${fmt(Math.abs(walletData.pnl || 0))}`;
   });
 });
 
-// Legacy handler for old setwallet action
-bot.action('portfolio:setwallet', async (ctx) => {
-  await safeAnswer(ctx);
-  setUserState(ctx.chat.id, { awaiting: 'portfoliowallet' });
-  await safeEdit(ctx, `➕ *Add Wallet*\n\nPaste a Solana wallet address:`, {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([[Markup.button.callback('« Cancel', 'nav:portfolio')]])
-  });
-});
 
 bot.action(/^view:lp:(.+)$/, async (ctx) => {
   await safeAnswer(ctx);
@@ -7528,6 +7477,7 @@ const ALLOWED_TOGGLES = new Set([
   'enabled', 'cipherBuys', 'cipherSells', 'cipherLpAdd', 'cipherLpRemove',
   'trackOtherPools', 'otherLpAdd', 'otherLpRemove', 'otherBuys', 'otherSells',
   'walletAlerts', 'dailyDigest', 'newPoolAlerts', 'lockAlerts', 'rewardAlerts',
+  'closePoolAlerts', 'protocolFeeAlerts', 'adminAlerts',
 ]);
 
 bot.action(/^tog:(.+)$/, async (ctx) => {
@@ -7565,6 +7515,10 @@ bot.action(/^tog:(.+)$/, async (ctx) => {
       : '📭 Daily digest disabled.';
     await safeAnswer(ctx, digestMsg);
     await safeEdit(ctx, text.settings(updated), { parse_mode: 'Markdown', ...menu.settings(updated) });
+  } else if (['closePoolAlerts', 'protocolFeeAlerts', 'adminAlerts', 'newPoolAlerts', 'lockAlerts', 'rewardAlerts'].includes(field)) {
+    const labels = { closePoolAlerts: 'Close Pool', protocolFeeAlerts: 'Protocol Fee', adminAlerts: 'Admin', newPoolAlerts: 'New Pool', lockAlerts: 'Lock/Unlock', rewardAlerts: 'Reward' };
+    await safeAnswer(ctx, `${updated[field] ? '✅' : '❌'} ${labels[field]} alerts ${updated[field] ? 'enabled' : 'disabled'}`);
+    await safeEdit(ctx, text.settings(updated), { parse_mode: 'Markdown', ...menu.settings(updated) });
   } else {
     await safeEdit(ctx, text.settings(updated), { parse_mode: 'Markdown', ...menu.settings(updated) });
   }
@@ -7583,8 +7537,9 @@ bot.action(/^thresh:(.+)$/, async (ctx) => {
 
 bot.action(/^setth:(.+):(\d+)$/, async (ctx) => {
   const type = ctx.match[1];
-  const val = parseInt(ctx.match[2]);
+  const val = parseInt(ctx.match[2], 10);
   const fieldMap = { cipher: 'cipherThreshold', lp: 'otherLpThreshold', other: 'otherThreshold', watch: 'otherThreshold' };
+  if (!fieldMap[type] || isNaN(val) || val < 0 || val > 1000000) return safeAnswer(ctx, '❌ Invalid threshold');
   updateUser(ctx.chat.id, { [fieldMap[type]]: val });
   
   const user = getUser(ctx.chat.id);
@@ -7600,7 +7555,8 @@ bot.action(/^setth:(.+):(\d+)$/, async (ctx) => {
 // SNOOZE & QUIET
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.action(/^snooze:(\d+)$/, async (ctx) => {
-  const mins = parseInt(ctx.match[1]);
+  const mins = parseInt(ctx.match[1], 10);
+  if (isNaN(mins) || mins < 0 || mins > 1440) return safeAnswer(ctx, '❌ Invalid snooze duration');
   updateUser(ctx.chat.id, { snoozedUntil: Date.now() + mins * 60000 });
   const label = mins >= 60 ? `${mins/60} hour${mins > 60 ? 's' : ''}` : `${mins} minutes`;
   await safeAnswer(ctx, `🔕 Snoozed for ${label}`);
@@ -7616,15 +7572,18 @@ bot.action('snooze:off', async (ctx) => {
 });
 
 bot.action(/^snooze:alert:(\d+)$/, async (ctx) => {
-  const mins = parseInt(ctx.match[1]);
+  const mins = parseInt(ctx.match[1], 10);
+  if (isNaN(mins) || mins < 0 || mins > 1440) return safeAnswer(ctx, '❌ Invalid snooze duration');
   updateUser(ctx.chat.id, { snoozedUntil: Date.now() + mins * 60000 });
   const label = mins >= 60 ? `${mins/60}h` : `${mins}m`;
-  await safeAnswer(ctx, `🔕 Snoozed for ${label}`);
+  await safeAnswer(ctx, `🔕 Snoozed for ${label}. Alerts paused.`);
+  try { await ctx.editMessageReplyMarkup(undefined); } catch (_) {}
 });
 
 bot.action(/^quiet:(\d+):(\d+)$/, async (ctx) => {
-  const start = parseInt(ctx.match[1]);
-  const end = parseInt(ctx.match[2]);
+  const start = parseInt(ctx.match[1], 10);
+  const end = parseInt(ctx.match[2], 10);
+  if (isNaN(start) || isNaN(end) || start < 0 || start > 23 || end < 0 || end > 23) return safeAnswer(ctx, '❌ Invalid hours (0-23)');
   updateUser(ctx.chat.id, { quietStart: start, quietEnd: end });
   await safeAnswer(ctx, `🌙 Quiet hours set!`);
   const user = getUser(ctx.chat.id);
@@ -7635,7 +7594,7 @@ bot.action('quiet:off', async (ctx) => {
   updateUser(ctx.chat.id, { quietStart: null, quietEnd: null });
   await safeAnswer(ctx, '🔔 Quiet hours off');
   const user = getUser(ctx.chat.id);
-  await safeEdit(ctx, text.snooze(user), { parse_mode: 'Markdown', ...menu.snooze(user) });
+  await safeEdit(ctx, text.quiet(user), { parse_mode: 'Markdown', ...menu.quiet(user) });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -7713,8 +7672,8 @@ bot.action(/^do:rmpool:(.+)$/, async (ctx) => {
 
 bot.action('do:resetstats', async (ctx) => {
   updateUser(ctx.chat.id, {
-    stats: { cipherBuys: 0, cipherSells: 0, cipherLp: 0, otherLp: 0, otherTrades: 0, walletAlerts: 0, volume: 0 },
-    todayStats: { trades: 0, lp: 0, wallet: 0, lastReset: Date.now() },
+    stats: { cipherBuys: 0, cipherSells: 0, cipherLp: 0, otherLp: 0, otherTrades: 0, walletAlerts: 0, events: 0, volume: 0 },
+    todayStats: { trades: 0, lp: 0, wallet: 0, events: 0, lastReset: Date.now() },
     recentAlerts: [],
   });
   await safeAnswer(ctx, '✅ Stats reset');
@@ -7751,7 +7710,7 @@ bot.action(/^confirm:rmpool:(.+)$/, async (ctx) => {
   const pool = poolMap.get(poolId);
   const pairName = pool?.pairName || 'Pool';
 
-  await safeEdit(ctx, `⚠️ *Remove Pool?*\n\n💧 ${pairName}\n\nRemove from your watchlist?`, {
+  await safeEdit(ctx, `⚠️ *Remove Pool?*\n\n💧 ${escMd(pairName)}\n\nRemove from your watchlist?`, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
       [Markup.button.callback('🗑️ Yes, Remove', `do:rmpool:${poolId}`)],
@@ -8064,10 +8023,10 @@ bot.on('text', async (ctx) => {
       } else {
         const results = searchPools(searchQuery);
         if (results.length === 0) {
-          await ctx.reply(`❌ *No results for "${searchQuery}"*\n\nTry a different search term.`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('🔍 Try Again', 'input:search')], [Markup.button.callback('« Back', 'nav:watchlist')]]) });
+          await ctx.reply(`❌ *No results for "${escMd(searchQuery)}"*\n\nTry a different search term.`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('🔍 Try Again', 'input:search')], [Markup.button.callback('« Back', 'nav:watchlist')]]) });
           return;
         }
-        await ctx.reply(`🔍 *Results for "${searchQuery}"*\n\n*${results.length} pool${results.length !== 1 ? 's' : ''} found:*`, { parse_mode: 'Markdown', ...menu.searchResults(results, user) });
+        await ctx.reply(`🔍 *Results for "${escMd(searchQuery)}"*\n\n*${results.length} pool${results.length !== 1 ? 's' : ''} found:*`, { parse_mode: 'Markdown', ...menu.searchResults(results, user) });
       }
     }
     
@@ -8091,9 +8050,9 @@ bot.on('text', async (ctx) => {
         // Search by name/symbol
         const results = searchPools(searchQuery);
         if (results.length === 0) {
-          await ctx.reply(`❌ *No results for "${searchQuery}"*\n\nTry a different search term.`, { 
-            parse_mode: 'Markdown', 
-            ...Markup.inlineKeyboard([[Markup.button.callback('🔍 Try Again', 'pools:search')], [Markup.button.callback('« Back', 'nav:pools')]]) 
+          await ctx.reply(`❌ *No results for "${escMd(searchQuery)}"*\n\nTry a different search term.`, {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([[Markup.button.callback('🔍 Try Again', 'pools:search')], [Markup.button.callback('« Back', 'nav:pools')]])
           });
           return;
         }
@@ -8107,9 +8066,9 @@ bot.on('text', async (ctx) => {
         });
         btns.push([Markup.button.callback('🔍 Search Again', 'pools:search'), Markup.button.callback('« Back', 'nav:pools')]);
         
-        await ctx.reply(`🔍 *Results for "${searchQuery}"*\n\n*${results.length} pool${results.length !== 1 ? 's' : ''} found:*`, { 
-          parse_mode: 'Markdown', 
-          ...Markup.inlineKeyboard(btns) 
+        await ctx.reply(`🔍 *Results for "${escMd(searchQuery)}"*\n\n*${results.length} pool${results.length !== 1 ? 's' : ''} found:*`, {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard(btns)
         });
       }
     }
@@ -8237,7 +8196,7 @@ ${pnlIcon} PnL: ${pnl >= 0 ? '+' : '-'}${fmt(Math.abs(pnl))}
       // Build the digest message
       const msg = `☀️ *Good Morning!*
 
-📊 *Daily Digest* — ${new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}
+📊 *Daily Digest* — ${new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', timeZone: 'UTC' })}
 
 *Market Snapshot*
 ◎ SOL: ${solPrice ? `$${solPrice.toFixed(2)}` : 'N/A'}
@@ -8248,10 +8207,11 @@ ${portfolioSection}
 📊 Trade Alerts: ${stats.trades}
 💧 LP Alerts: ${stats.lp}
 👛 Wallet Alerts: ${stats.wallet}
+🔔 Event Alerts: ${stats.events || 0}
 
 *All Time*
 📈 Total Volume Tracked: ${fmt(allTimeStats.volume || 0)}
-🔄 Total Alerts: ${(allTimeStats.cipherBuys || 0) + (allTimeStats.cipherSells || 0) + (allTimeStats.cipherLp || 0) + (allTimeStats.otherLp || 0) + (allTimeStats.otherTrades || 0) + (allTimeStats.walletAlerts || 0)}
+🔄 Total Alerts: ${(allTimeStats.cipherBuys || 0) + (allTimeStats.cipherSells || 0) + (allTimeStats.cipherLp || 0) + (allTimeStats.otherLp || 0) + (allTimeStats.otherTrades || 0) + (allTimeStats.walletAlerts || 0) + (allTimeStats.events || 0)}
 
 _Have a great day! 🚀_`;
 
@@ -8273,7 +8233,10 @@ _Have a great day! 🚀_`;
       
     } catch (e) {
       errors++;
-      if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
+      if (e.code === 429) {
+        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+        i--; // Retry this user after rate limit delay
+      } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         user.enabled = false;
         user.blocked = true;
         saveUserDebounced(user);
@@ -8284,7 +8247,7 @@ _Have a great day! 🚀_`;
   
   // Reset todayStats for all users after digest is sent
   for (const user of users.values()) {
-    user.todayStats = { trades: 0, lp: 0, wallet: 0, lastReset: Date.now() };
+    user.todayStats = { trades: 0, lp: 0, wallet: 0, events: 0, lastReset: Date.now() };
   }
   saveUsersDebounced();
 
@@ -8300,16 +8263,17 @@ async function broadcastTradeAlert({ pool, trade, usd, isBuy, sig }) {
     let shouldSend = false;
     
     if (pool.isCipher) {
-      if (isBuy && user.cipherBuys && usd >= user.cipherThreshold) shouldSend = true;
-      if (!isBuy && user.cipherSells && usd >= user.cipherThreshold) shouldSend = true;
+      const threshold = user.cipherThreshold ?? 100;
+      if (isBuy && user.cipherBuys && usd >= threshold) shouldSend = true;
+      if (!isBuy && user.cipherSells && usd >= threshold) shouldSend = true;
     } else {
       if (user.trackOtherPools === false) continue;
       const base = pool.baseMint || pool.base;
       const quote = pool.quoteMint || pool.quote;
       const tokenTracked = user.trackedTokens?.includes(base) || user.trackedTokens?.includes(quote);
       const poolWatched = user.watchlist?.includes(pool.id);
-      
-      if ((tokenTracked || poolWatched) && usd >= user.otherThreshold) {
+      const threshold = user.otherThreshold ?? 500;
+      if ((tokenTracked || poolWatched) && usd >= threshold) {
         if (isBuy && user.otherBuys) shouldSend = true;
         if (!isBuy && user.otherSells) shouldSend = true;
       }
@@ -8359,7 +8323,7 @@ async function broadcastTradeAlert({ pool, trade, usd, isBuy, sig }) {
   
   // Build the message
   let msg = `${header}
-*${pool.pairName}*
+*${escMd(pool.pairName)}*
 
 💵 *${fmt(usd)}*
 ${size.bar} ${size.tier}
@@ -8407,7 +8371,10 @@ ${size.bar} ${size.tier}
       // Small delay every 20 messages to avoid rate limits
       if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
-      if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
+      if (e.code === 429) {
+        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+        i--; // Retry this user after rate limit delay
+      } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         user.enabled = false;
         user.blocked = true;
       }
@@ -8425,12 +8392,14 @@ async function broadcastLpAlert({ pool, isAdd, usd, sig, msg: originalMsg }) {
     let shouldSend = false;
     
     if (pool.isCipher) {
-      if (isAdd && user.cipherLpAdd && usd >= (user.cipherThreshold || 100)) shouldSend = true;
-      if (!isAdd && user.cipherLpRemove && usd >= (user.cipherThreshold || 100)) shouldSend = true;
+      const threshold = user.cipherThreshold ?? 100;
+      if (isAdd && user.cipherLpAdd && usd >= threshold) shouldSend = true;
+      if (!isAdd && user.cipherLpRemove && usd >= threshold) shouldSend = true;
     } else {
       if (user.trackOtherPools === false) continue;
-      if (isAdd && user.otherLpAdd && usd >= (user.otherLpThreshold || 500)) shouldSend = true;
-      if (!isAdd && user.otherLpRemove && usd >= (user.otherLpThreshold || 500)) shouldSend = true;
+      const threshold = user.otherLpThreshold ?? 500;
+      if (isAdd && user.otherLpAdd && usd >= threshold) shouldSend = true;
+      if (!isAdd && user.otherLpRemove && usd >= threshold) shouldSend = true;
     }
     
     if (shouldSend) toNotify.push(user);
@@ -8465,7 +8434,7 @@ async function broadcastLpAlert({ pool, isAdd, usd, sig, msg: originalMsg }) {
   
   // Build message
   let alertMsg = `${header}
-*${pool.pairName}*
+*${escMd(pool.pairName)}*
 
 💵 *${fmt(usd)}*
 ${size.bar} ${size.tier}
@@ -8512,7 +8481,10 @@ ${size.bar} ${size.tier}
       
       if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
-      if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
+      if (e.code === 429) {
+        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+        i--; // Retry this user after rate limit delay
+      } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         user.enabled = false;
         user.blocked = true;
       }
@@ -8538,7 +8510,7 @@ async function broadcastWalletAlert({ wallet, signature, tokenSymbol, isBuy, usd
     : `🐋 ━━━ *WHALE SELL* ━━━ 🐋`;
 
   const msg = `${header}
-*${tokenSymbol}*
+*${escMd(tokenSymbol)}*
 
 💵 *${fmt(usdValue)}*
 ${size.bar} ${size.tier}
@@ -8564,7 +8536,10 @@ ${size.bar} ${size.tier}
 
       if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
-      if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
+      if (e.code === 429) {
+        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+        i--; // Retry this user after rate limit delay
+      } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         user.enabled = false;
         user.blocked = true;
       }
@@ -8590,7 +8565,7 @@ async function broadcastNewPoolAlert({ poolId, user: creator, sig, timestamp }) 
 
   const creatorAddr = creator ? `\n👤 Creator: \`${shortAddr(creator)}\`` : '';
   const msg = `🆕 ━━━ *NEW POOL* ━━━ 🆕
-*${pairName}*
+*${escMd(pairName)}*
 ${creatorAddr}
 \`${poolId || 'N/A'}\`
 
@@ -8605,9 +8580,14 @@ ${creatorAddr}
         ...(poolId && sig ? menu.alertActions(poolId, sig) : {}),
       });
       addRecentAlert(u.chatId, { type: 'pool_init', pair: pairName, usd: 0, sig });
+      u.stats = u.stats || {}; u.stats.events = (u.stats.events || 0) + 1;
+      u.todayStats = u.todayStats || {}; u.todayStats.events = (u.todayStats.events || 0) + 1;
       if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
-      if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
+      if (e.code === 429) {
+        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+        i--; // Retry this user after rate limit delay
+      } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         u.enabled = false;
         u.blocked = true;
       }
@@ -8632,7 +8612,7 @@ async function broadcastLockAlert({ poolId, isLock, user: actor, sig, timestamp 
   const actorAddr = actor ? `\n👤 \`${shortAddr(actor)}\`` : '';
 
   const msg = `${icon} ━━━ *${action}* ━━━ ${icon}
-*${pairName}*
+*${escMd(pairName)}*
 ${actorAddr}
 ⏱ ${fmtTime()} UTC • Orbit`;
 
@@ -8645,9 +8625,14 @@ ${actorAddr}
         ...(poolId && sig ? menu.alertActions(poolId, sig) : {}),
       });
       addRecentAlert(u.chatId, { type: isLock ? 'lock' : 'unlock', pair: pairName, usd: 0, sig });
+      u.stats = u.stats || {}; u.stats.events = (u.stats.events || 0) + 1;
+      u.todayStats = u.todayStats || {}; u.todayStats.events = (u.todayStats.events || 0) + 1;
       if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
-      if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
+      if (e.code === 429) {
+        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+        i--; // Retry this user after rate limit delay
+      } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         u.enabled = false;
         u.blocked = true;
       }
@@ -8668,7 +8653,7 @@ async function broadcastRewardClaimAlert({ user: claimer, sig, poolId, timestamp
   if (toNotify.length === 0) return;
 
   const claimerAddr = claimer ? `\n👤 \`${shortAddr(claimer)}\`` : '';
-  const poolLine = pairName ? `\n*Pool:* ${pairName}` : '';
+  const poolLine = pairName ? `\n*Pool:* ${escMd(pairName)}` : '';
 
   const msg = `🎁 ━━━ *REWARDS CLAIMED* ━━━ 🎁
 ${poolLine}${claimerAddr}
@@ -8684,9 +8669,151 @@ ${poolLine}${claimerAddr}
         ...(sig ? menu.walletAlertActions(sig) : {}),
       });
       addRecentAlert(u.chatId, { type: 'reward', pair: pairName, usd: 0, sig });
+      u.stats = u.stats || {}; u.stats.events = (u.stats.events || 0) + 1;
+      u.todayStats = u.todayStats || {}; u.todayStats.events = (u.todayStats.events || 0) + 1;
       if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
-      if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
+      if (e.code === 429) {
+        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+        i--; // Retry this user after rate limit delay
+      } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
+        u.enabled = false;
+        u.blocked = true;
+      }
+    }
+  }
+  saveUsersDebounced();
+}
+
+async function broadcastClosePoolAlert({ poolId, user: actor, sig, timestamp }) {
+  const pool = poolMap.get(poolId);
+  const pairName = pool?.pairName || 'Unknown Pool';
+
+  const toNotify = [];
+  for (const u of users.values()) {
+    if (!u.enabled || u.blocked || isUserSnoozed(u)) continue;
+    if (u.closePoolAlerts !== false) toNotify.push(u);
+  }
+  if (toNotify.length === 0) return;
+
+  const actorAddr = actor ? `\n👤 \`${shortAddr(actor)}\`` : '';
+
+  const msg = `🚫 ━━━ *POOL CLOSED* ━━━ 🚫
+*${escMd(pairName)}*
+${actorAddr}
+⏱ ${fmtTime()} UTC • Orbit`;
+
+  for (let i = 0; i < toNotify.length; i++) {
+    const u = toNotify[i];
+    try {
+      await bot.telegram.sendMessage(u.chatId, msg, {
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+        ...(sig ? menu.walletAlertActions(sig) : {}),
+      });
+      addRecentAlert(u.chatId, { type: 'close_pool', pair: pairName, usd: 0, sig });
+      u.stats = u.stats || {}; u.stats.events = (u.stats.events || 0) + 1;
+      u.todayStats = u.todayStats || {}; u.todayStats.events = (u.todayStats.events || 0) + 1;
+      if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
+    } catch (e) {
+      if (e.code === 429) {
+        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+        i--; // Retry this user after rate limit delay
+      } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
+        u.enabled = false;
+        u.blocked = true;
+      }
+    }
+  }
+  saveUsersDebounced();
+}
+
+async function broadcastProtocolFeeAlert({ poolId, user: actor, sig, timestamp }) {
+  const pool = poolId ? poolMap.get(poolId) : null;
+  const pairName = pool?.pairName || '';
+
+  const toNotify = [];
+  for (const u of users.values()) {
+    if (!u.enabled || u.blocked || isUserSnoozed(u)) continue;
+    if (u.protocolFeeAlerts !== false) toNotify.push(u);
+  }
+  if (toNotify.length === 0) return;
+
+  const actorAddr = actor ? `\n👤 \`${shortAddr(actor)}\`` : '';
+  const poolLine = pairName ? `\n*Pool:* ${escMd(pairName)}` : '';
+
+  const msg = `💰 ━━━ *PROTOCOL FEES CLAIMED* ━━━ 💰
+${poolLine}${actorAddr}
+⏱ ${fmtTime()} UTC • Orbit`;
+
+  for (let i = 0; i < toNotify.length; i++) {
+    const u = toNotify[i];
+    try {
+      await bot.telegram.sendMessage(u.chatId, msg, {
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+        ...(sig ? menu.walletAlertActions(sig) : {}),
+      });
+      addRecentAlert(u.chatId, { type: 'protocol_fees', pair: pairName, usd: 0, sig });
+      u.stats = u.stats || {}; u.stats.events = (u.stats.events || 0) + 1;
+      u.todayStats = u.todayStats || {}; u.todayStats.events = (u.todayStats.events || 0) + 1;
+      if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
+    } catch (e) {
+      if (e.code === 429) {
+        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+        i--; // Retry this user after rate limit delay
+      } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
+        u.enabled = false;
+        u.blocked = true;
+      }
+    }
+  }
+  saveUsersDebounced();
+}
+
+async function broadcastAdminAlert({ poolId, user: actor, sig, timestamp, eventName }) {
+  const pool = poolId ? poolMap.get(poolId) : null;
+  const pairName = pool?.pairName || '';
+
+  const toNotify = [];
+  for (const u of users.values()) {
+    if (!u.enabled || u.blocked || isUserSnoozed(u)) continue;
+    if (u.adminAlerts !== false) toNotify.push(u);
+  }
+  if (toNotify.length === 0) return;
+
+  const subtypes = {
+    AdminUpdated: 'Admin Rotated',
+    AuthoritiesUpdated: 'Authorities Changed',
+    FeeConfigUpdated: 'Fee Config Changed',
+    PauseUpdated: 'Pause State Changed',
+  };
+  const subLabel = subtypes[eventName] || eventName || 'Config Change';
+  const actorAddr = actor ? `\n👤 \`${shortAddr(actor)}\`` : '';
+  const poolLine = pairName ? `\n*Pool:* ${escMd(pairName)}` : '';
+
+  const msg = `⚠️ ━━━ *ADMIN UPDATE* ━━━ ⚠️
+*${escMd(subLabel)}*
+${poolLine}${actorAddr}
+⏱ ${fmtTime()} UTC • Orbit`;
+
+  for (let i = 0; i < toNotify.length; i++) {
+    const u = toNotify[i];
+    try {
+      await bot.telegram.sendMessage(u.chatId, msg, {
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+        ...(sig ? menu.walletAlertActions(sig) : {}),
+      });
+      addRecentAlert(u.chatId, { type: 'admin', pair: pairName, usd: 0, sig });
+      u.stats = u.stats || {}; u.stats.events = (u.stats.events || 0) + 1;
+      u.todayStats = u.todayStats || {}; u.todayStats.events = (u.todayStats.events || 0) + 1;
+      if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
+    } catch (e) {
+      if (e.code === 429) {
+        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+        i--; // Retry this user after rate limit delay
+      } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         u.enabled = false;
         u.blocked = true;
       }
@@ -8698,7 +8825,6 @@ ${poolLine}${claimerAddr}
 // ═══════════════════════════════════════════════════════════════════════════════
 // ERROR & STARTUP
 // ═══════════════════════════════════════════════════════════════════════════════
-bot.catch((err) => log.error('Bot error:', err.message));
 
 async function start() {
   log.info('🚀 Orbit Tracker v11.0\n');
@@ -8743,16 +8869,16 @@ async function start() {
   await connectHeliusWs();
   
   // Refresh intervals
-  setInterval(fetchPools, CONFIG.poolRefreshInterval);
-  setInterval(fetchPrices, CONFIG.priceRefreshInterval);
-  setInterval(fetchVolumes, CONFIG.poolRefreshInterval);
-  setInterval(checkOrbitHealth, 60000); // Health check every minute
-  
+  activeIntervals.push(setInterval(fetchPools, CONFIG.poolRefreshInterval));
+  activeIntervals.push(setInterval(fetchPrices, CONFIG.priceRefreshInterval));
+  activeIntervals.push(setInterval(fetchVolumes, CONFIG.poolRefreshInterval));
+  activeIntervals.push(setInterval(checkOrbitHealth, 60000)); // Health check every minute
+
   // Backup polling (only runs when WebSocket is down)
-  setInterval(pollTradesBackup, CONFIG.tradesPollInterval);
-  
+  activeIntervals.push(setInterval(pollTradesBackup, CONFIG.tradesPollInterval));
+
   // Cache cleanup every 15 minutes to prevent memory bloat
-  setInterval(() => {
+  activeIntervals.push(setInterval(() => {
     cleanPriceCache();
     cleanTokenOverviewCache();
     cleanUserStakeCache();
@@ -8768,15 +8894,15 @@ async function start() {
       log.info(`🧹 Pruned token map from >50k to ${tokens.size} entries`);
     }
     log.debug(`🧹 Cache cleanup: price=${priceCache.size}, tokens=${tokens.size}, users=${users.size}`);
-  }, 15 * 60 * 1000);
+  }, 15 * 60 * 1000));
   
   // Auto-save every 5 minutes as extra precaution
-  setInterval(() => {
+  activeIntervals.push(setInterval(() => {
     if (users.size > 0) saveUsersDebounced();
-  }, 5 * 60 * 1000);
-  
+  }, 5 * 60 * 1000));
+
   // Auto-sync portfolios for active users every 5 minutes
-  setInterval(async () => {
+  activeIntervals.push(setInterval(async () => {
     const now = Date.now();
     let synced = 0;
     
@@ -8797,7 +8923,7 @@ async function start() {
     }
     
     if (synced > 0) log.debug(`📊 Auto-synced ${synced} portfolios`);
-  }, CONFIG.portfolioAutoSyncInterval);
+  }, CONFIG.portfolioAutoSyncInterval));
   
   // ═══════════════════════════════════════════════════════════════════════════════
   // SCHEDULED JOBS (node-cron)
@@ -8805,20 +8931,20 @@ async function start() {
   
   // Daily digest at configured time (default 9:00 AM UTC)
   const digestCron = `${CONFIG.dailyDigestMinute} ${CONFIG.dailyDigestHour} * * *`;
-  cron.schedule(digestCron, async () => {
+  activeCronJobs.push(cron.schedule(digestCron, async () => {
     log.info('📬 Sending daily digests...');
     await sendDailyDigests();
-  }, { timezone: 'UTC' });
+  }, { timezone: 'UTC' }));
   log.info(`📅 Daily digest scheduled for ${CONFIG.dailyDigestHour}:${String(CONFIG.dailyDigestMinute).padStart(2, '0')} UTC`);
-  
+
   // Weekly stats reset (Sunday at midnight UTC)
-  cron.schedule('0 0 * * 0', () => {
+  activeCronJobs.push(cron.schedule('0 0 * * 0', () => {
     log.info('📊 Weekly stats checkpoint');
     // Could add weekly summary feature here
-  }, { timezone: 'UTC' });
-  
+  }, { timezone: 'UTC' }));
+
   // Database optimization (daily at 3 AM UTC) — pragma optimize only, no VACUUM in WAL mode
-  cron.schedule('0 3 * * *', () => {
+  activeCronJobs.push(cron.schedule('0 3 * * *', () => {
     log.info('🔧 Running database optimization...');
     try {
       if (db) {
@@ -8829,7 +8955,7 @@ async function start() {
     } catch (e) {
       log.error('Database optimization failed:', e.message);
     }
-  }, { timezone: 'UTC' });
+  }, { timezone: 'UTC' }));
   
   // Register commands with Telegram (shows in command menu)
   await bot.telegram.setMyCommands([
@@ -8861,7 +8987,7 @@ async function start() {
   // HTTP HEALTH CHECK SERVER (for Fly.io / container orchestration)
   // ═══════════════════════════════════════════════════════════════════════════════
   const HEALTH_PORT = process.env.PORT || 8080;
-  const healthServer = http.createServer((req, res) => {
+  healthServer = http.createServer((req, res) => {
     if (req.url === '/health' || req.url === '/') {
       const health = {
         status: 'ok',
@@ -8924,11 +9050,29 @@ process.on('uncaughtException', (error) => {
 // Graceful shutdown function
 async function gracefulShutdown(signal) {
   log.info(`\n🛑 Received ${signal}. Shutting down gracefully...`);
-  
+
+  // Force exit after 10 seconds if shutdown hangs
+  const shutdownTimer = setTimeout(() => {
+    log.error('Shutdown timed out after 10s, forcing exit');
+    process.exit(1);
+  }, 10000);
+  shutdownTimer.unref();
+
   // Stop accepting new connections
   orbitWsRunning = false;
   heliusWsRunning = false;
-  
+
+  // Clear all intervals and cron jobs
+  activeIntervals.forEach(id => clearInterval(id));
+  activeCronJobs.forEach(job => job.stop());
+  log.info(`✅ Cleared ${activeIntervals.length} intervals and ${activeCronJobs.length} cron jobs`);
+
+  // Close health server
+  if (healthServer) {
+    healthServer.close();
+    log.info('✅ Health server closed');
+  }
+
   // Close WebSocket connections
   try {
     if (orbitWs && orbitWs.readyState === WebSocket.OPEN) {
