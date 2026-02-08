@@ -15,7 +15,8 @@ RUN apk add --no-cache \
     librsvg-dev \
     pixman-dev \
     fontconfig \
-    ttf-dejavu
+    ttf-dejavu \
+    su-exec
 
 WORKDIR /app
 
@@ -31,9 +32,6 @@ COPY index.js ./
 # Create data directory
 RUN mkdir -p /data && chown -R node:node /data /app
 
-# Switch to non-root user
-USER node
-
 # Expose health check port
 EXPOSE 8080
 
@@ -41,5 +39,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
 
-# Start the bot
-CMD ["node", "index.js"]
+# Fix volume permissions at runtime then run as non-root
+CMD chown -R node:node /data && exec su-exec node node index.js
