@@ -1,4 +1,4 @@
-#  Orbit Tracker v11.0
+# Orbit Tracker v11.0
 
 Professional Telegram bot for tracking Orbit Finance DLMM pools on Solana.
 
@@ -6,45 +6,53 @@ Professional Telegram bot for tracking Orbit Finance DLMM pools on Solana.
 ![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-green)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)
 
-## ✨ Features
+## Features
 
-### 🌐 Pool Explorer
-- **Browse All Pools** - View all Orbit pools with sorting
-- **Sort by Volume/TVL/Trades** - Find the most active pools
-- **Trending Pools** - Top 10 by 24h volume
-- **New Pools** - Recently added pools (last 48h)
-- **Pool Search** - Find by name, symbol, or address
-- **Pool Details** - Price, volume, TVL, fees, links
+### Pool Explorer
+- **Browse All Pools** - Paginated pool list with sorting by volume, TVL, or trades
+- **Trending Pools** - Top pools ranked by 24h volume
+- **New Pools** - Recently initialized pools (last 48h) with alerts
+- **Pool Search** - Find by name, symbol, or mint address
+- **Pool Details** - Price, volume, TVL, fees, and DexScreener links
+- **Watchlists** - Track favorite pools with quick-access buttons
 
-### 🔔 Real-time Alerts
-- **CIPHER Alerts** - Buy/sell trades and LP events
-- **Other Pool Alerts** - Configurable for all pools
-- **Whale Tracking** - Monitor specific wallets
-- **LP Monitoring** - Add/remove liquidity events
-- **Custom Thresholds** - Set minimum alert amounts
+### Real-time Alerts
+- **CIPHER Alerts** - Buy/sell trades and LP add/remove events
+- **Other Pool Alerts** - Configurable alerts for all tracked pools
+- **Wallet Tracking** - Monitor up to 5 wallets for on-chain activity
+- **Whale Monitoring** - Track large wallet movements with custom thresholds
+- **Lock/Unlock Alerts** - Liquidity locking and unlocking events
+- **Reward Claim Alerts** - Staking reward claim notifications
+- **Protocol Fee Alerts** - Fee distribution events
+- **Admin Alerts** - Governance and admin action notifications
+- **New Pool Alerts** - Notification when new pools are initialized
 
-### 📈 Portfolio Tracking
-- **Multi-Wallet Support** - Track up to 5 wallets
-- **Net Worth** - Total value across all holdings
-- **PnL Analytics** - Realized & unrealized profit/loss
-- **Token Holdings** - All tokens with USD values
-- **LP Positions** - Active liquidity positions
+### Portfolio Tracking
+- **Multi-Wallet Support** - Track up to 5 Solana wallets
+- **Net Worth** - Total value across all holdings in USD
+- **PnL Analytics** - Realized and unrealized profit/loss
+- **Token Holdings** - All tokens with live USD values
+- **LP Positions** - Active liquidity positions with details
 - **Staked CIPHER** - sCIPHER balance and value
+- **Trade History** - Full swap history with PnL per trade
 
-### 📊 Charts & Analytics
-- **OHLCV Charts** - 1h, 4h, 1d, 1w timeframes
-- **PnL Leaderboards** - Top traders by profit
-- **Liquidity History** - LP event timeline
-- **Volume Statistics** - 24h trading data
+### Charts & Analytics
+- **OHLCV Charts** - Candlestick + volume charts (15m, 1h, 4h, 1d timeframes)
+- **DexScreener Integration** - Direct chart links on all chart views and pool pages
+- **PnL Leaderboards** - Top traders ranked by profit
+- **Liquidity History** - LP event timeline per pool
+- **Volume Statistics** - 24h trading data and trends
 
-### ⚙️ User Experience
-- **One-tap Setup** - Quick preset configurations
-- **Snooze/Quiet Hours** - Pause alerts temporarily
-- **Daily Digest** - Summary at 9:00 UTC
-- **Watchlists** - Track favorite tokens/pools
-- **Alert History** - Recent notifications
+### User Experience
+- **One-tap Presets** - Quick setup configurations for new users
+- **18 Toggle Settings** - Granular control over every alert type
+- **Snooze** - Pause alerts for a custom duration
+- **Quiet Hours** - Mute alerts during specified time ranges
+- **Daily Digest** - Portfolio and activity summary delivered daily
+- **Alert History** - View recent notifications
+- **Custom Thresholds** - Set minimum USD amounts for alerts
 
-## 📱 Commands
+## Commands
 
 | Command | Description |
 |---------|-------------|
@@ -71,7 +79,7 @@ Professional Telegram bot for tracking Orbit Finance DLMM pools on Solana.
 | `/status` | Bot & API status |
 | `/help` | Show all commands |
 
-## 🚀 Deployment (Fly.io)
+## Deployment (Fly.io)
 
 ### Prerequisites
 - [Fly.io account](https://fly.io)
@@ -108,16 +116,16 @@ fly deploy
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `TELEGRAM_BOT_TOKEN` | ✅ | Bot token from BotFather |
-| `HELIUS_API_KEY` | ✅ | Helius RPC API key |
-| `DATA_DIR` | ❌ | Data directory (default: `/data`) |
-| `DEBUG` | ❌ | Enable debug logs (default: `false`) |
+| `TELEGRAM_BOT_TOKEN` | Yes | Bot token from BotFather |
+| `HELIUS_API_KEY` | Yes | Helius RPC API key |
+| `DATA_DIR` | No | Data directory (default: `/data`) |
+| `DEBUG` | No | Enable debug logs (default: `false`) |
 
-## 📁 Project Structure
+## Architecture
 
 ```
-orbit-tracker/
-├── index.js          # Main bot code (8,300+ lines)
+orbit-finance-tracker/
+├── index.js          # Main bot (~9,100 lines)
 ├── package.json      # Dependencies
 ├── Dockerfile        # Container config
 ├── fly.toml          # Fly.io config
@@ -127,44 +135,50 @@ orbit-tracker/
 └── README.md         # Documentation
 ```
 
-## 🛠️ Tech Stack
+### Transaction Detection
+5-method cascade for classifying Solana transactions:
+1. Explicit field matching
+2. Anchor instruction discriminators (`sha256("global:<name>")[0..8]`)
+3. Anchor event log parsing (`sha256("event:<name>")[0..8]`)
+4. Heuristic analysis
+5. Trade field detection
+
+### 15 Transaction Types
+`SWAP` · `LP_ADD` · `LP_REMOVE` · `CLOSE_POSITION` · `LOCK_LIQUIDITY` · `UNLOCK_LIQUIDITY` · `POOL_INIT` · `FEES_DISTRIBUTED` · `CLAIM_REWARDS` · `SYNC_STAKE` · `CLOSE_POOL` · `PROTOCOL_FEES` · `ADMIN` · `SETUP` · `UNKNOWN`
+
+### Reliability
+- **Graceful shutdown** - 10s timeout with signal handling (SIGINT/SIGTERM), clears all intervals/cron jobs, closes WebSocket connections, saves state
+- **Rate limit handling** - 429 retry logic across all 9 broadcast functions with batched sends (20/batch, 100ms delay)
+- **Health monitoring** - TCP health check endpoint with auto-degradation after 3+ API failures
+- **Price fallback cascade** - Jupiter → DexScreener → Birdeye → CoinGecko
+- **Blocked user handling** - Catches 403 errors during broadcasts, filters deactivated users
+- **WAL mode SQLite** - Concurrent reads with crash-safe writes via better-sqlite3
+
+## Tech Stack
 
 - **Runtime:** Node.js 18+
 - **Framework:** Telegraf 4.x
-- **Database:** SQLite (better-sqlite3)
+- **Database:** SQLite (better-sqlite3, WAL mode)
 - **Blockchain:** Solana Web3.js, Helius SDK
 - **Charts:** Chart.js + chartjs-node-canvas
-- **Deployment:** Fly.io with persistent volumes
+- **Scheduling:** node-cron
+- **Deployment:** Docker on Fly.io with persistent volumes
 
-## 📊 Stats
+## Stats
 
-- **~8,300 lines** of production code
+- **~9,100 lines** of production code
 - **22 commands** registered
-- **81 action handlers**
-- **130+ try/catch** blocks
-- **180+ safe handler** calls
+- **40 action handlers** (inline buttons)
+- **9 broadcast functions** for real-time alerts
+- **15 transaction types** detected
+- **18 user-configurable toggles**
+- **151 try/catch blocks**
 
-## 🔄 Updates
+## License
 
-### v11.0.0 (Latest)
-- 🌐 Pool Explorer with sorting & search
-- 🔥 Trending pools feature
-- 🆕 New pools discovery
-- ⚙️ Other pools settings panel
-- 🔧 Multi-wallet save fix
-- 💰 Staked CIPHER price fix
-- 📱 Updated help & welcome
+MIT License - see [LICENSE](LICENSE) for details.
 
-### v10.9.0
-- Initial Fly.io deployment
-- Portfolio multi-wallet support
-- Staked CIPHER tracking
-
-## 📄 License
-
-MIT License - feel free to use and modify.
-
-## 🔗 Links
+## Links
 
 - **Bot:** [@OrbitFinanceTrackerBot](https://t.me/OrbitFinanceTrackerBot)
 - **Orbit Markets:** [markets.cipherlabsx.com](https://markets.cipherlabsx.com)
@@ -172,4 +186,4 @@ MIT License - feel free to use and modify.
 
 ---
 
-Made with ❤️ for the Cipher community
+Made with care for the Cipher community
