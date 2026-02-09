@@ -5310,7 +5310,7 @@ const menu = {
 
   // Portfolio wallet management menu
   portfolioWallets: (u) => {
-    const walletList = u?.portfolioWallets || [];
+    const walletList = [...(u?.portfolioWallets || [])];
     if (u?.myWallet && !walletList.includes(u.myWallet)) {
       walletList.unshift(u.myWallet);
     }
@@ -6501,7 +6501,7 @@ bot.command('leaderboard', async (ctx) => {
           mint = found[0];
           symbol = found[1].symbol;
         } else {
-          return await ctx.reply(`❌ Unknown token: ${escMd(mintOrSymbol)}\n\nUsage: \`/leaderboard [token]\`\nExamples:\n• /leaderboard\n• /leaderboard CIPHER\n• /leaderboard SOL`, { parse_mode: 'Markdown' });
+          return await ctx.reply(`❌ Unknown token: ${escMd(mintOrSymbol)}\n\nUsage: \`/leaderboard [token]\`\nExamples:\n• /leaderboard\n• /leaderboard CIPHER\n• /leaderboard SOL`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
         }
       }
     }
@@ -7641,7 +7641,7 @@ bot.action(/^tog:(.+)$/, async (ctx) => {
   } else if (field.startsWith('otherLp')) {
     await safeEdit(ctx, text.lp(updated), { parse_mode: 'Markdown', ...menu.lp(updated) });
   } else if (field === 'otherBuys' || field === 'otherSells') {
-    await safeEdit(ctx, text.watchlist(updated), { parse_mode: 'Markdown', ...menu.watchlist(updated) });
+    await safeEdit(ctx, text.otherPoolSettings(updated), { parse_mode: 'Markdown', ...menu.otherPoolSettings(updated) });
   } else if (field === 'dailyDigest') {
     // Special message for daily digest toggle
     const digestMsg = updated.dailyDigest 
@@ -7775,20 +7775,12 @@ bot.action('confirm:resetstats', async (ctx) => {
 
 bot.action('confirm:clearwatchlist', async (ctx) => {
   await safeAnswer(ctx);
-  await safeEdit(ctx, `⚠️ *Clear Watchlist?*\n\nThis will remove all items from your watchlist.`, { parse_mode: 'Markdown', ...menu.confirm('clearwatchlist', 'clear all', 'nav:watchlist') });
+  const user = getUser(ctx.chat.id);
+  const poolCount = user?.watchlist?.length || 0;
+  const tokenCount = user?.trackedTokens?.length || 0;
+  await safeEdit(ctx, `⚠️ *Clear Watchlist?*\n\nThis will remove all ${poolCount + tokenCount} items (${poolCount} pool${poolCount !== 1 ? 's' : ''}, ${tokenCount} token${tokenCount !== 1 ? 's' : ''}) from your watchlist.`, { parse_mode: 'Markdown', ...menu.confirm('clearwatchlist', 'clear all', 'nav:watchlist') });
 });
 
-bot.action(/^do:rmwallet:(.+)$/, async (ctx) => {
-  const wallet = ctx.match[1];
-  const user = getUser(ctx.chat.id);
-  if (user) {
-    user.wallets = (user.wallets || []).filter(w => w !== wallet);
-    saveUsersDebounced();  // Debounced for performance
-    refreshWalletSubscriptions();
-  }
-  await safeAnswer(ctx, '✅ Wallet removed');
-  await safeEdit(ctx, text.wallets(user), { parse_mode: 'Markdown', ...menu.wallets(user) });
-});
 
 bot.action(/^do:rmtoken:(.+)$/, async (ctx) => {
   const token = ctx.match[1];
@@ -7996,7 +7988,12 @@ bot.action(/^addall:(.+)$/, async (ctx) => {
       }
     });
     saveUsersDebounced();  // Debounced for performance
-    await safeAnswer(ctx, `✅ Added ${added} pools`);
+    const total = tokenPools.length;
+    const limitHit = (user.watchlist.length) + (user.trackedTokens?.length || 0) >= maxItems;
+    const msg = added === 0 ? '✅ Already tracking all pools'
+      : limitHit ? `✅ Added ${added} of ${total} pools (limit reached)`
+      : `✅ Added ${added} pool${added !== 1 ? 's' : ''}`;
+    await safeAnswer(ctx, msg);
   }
   await safeEdit(ctx, text.watchlist(user), { parse_mode: 'Markdown', ...menu.watchlist(user) });
 });
