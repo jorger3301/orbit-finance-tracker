@@ -1006,6 +1006,7 @@ async function fetchPrices() {
   
   // === PRIMARY: Jupiter API ===
   try {
+    if (jupiterLimiter) await jupiterLimiter.acquire();
     const solRes = await fetchWithRetry(`${JUPITER.price}?ids=SOL`);
     const solData = await solRes.json();
     if (solData?.data?.SOL?.price) {
@@ -1035,6 +1036,7 @@ async function fetchPrices() {
     for (let i = 0; i < mintArray.length; i += 50) {
       const batch = mintArray.slice(i, i + 50);
       try {
+        if (jupiterLimiter) await jupiterLimiter.acquire();
         const res = await fetchWithRetry(`${JUPITER.price}?ids=${batch.join(',')}`);
         const data = await res.json();
         if (data?.data) {
@@ -1168,10 +1170,12 @@ async function fetchPrices() {
 function getPrice(mint) {
   if (!mint) return null;
   if (mint === MINTS.USDC || mint === MINTS.USDT) return 1;
-  
+
   const cached = priceCache.get(mint);
   if (cached && Date.now() - cached.updatedAt < CONFIG.priceRefreshInterval * 2) {
-    return cached.price;
+    const price = cached.price;
+    if (typeof price !== 'number' || isNaN(price)) return null;
+    return price;
   }
   return null;
 }
@@ -2297,9 +2301,9 @@ async function pollTradesBackup() {
         const usd = estimateTradeUsd(trade, pool);
         const isBuy = trade.side === 'buy';
 
-        broadcastTradeAlert({ pool, trade, usd, isBuy, sig });
+        broadcastTradeAlert({ pool, trade, usd, isBuy, sig }).catch(e => log.debug('Trade alert failed:', e.message));
       }
-      
+
       if (trades[0]?.signature) {
         lastTradesByPool.set(pool.id, trades[0].signature);
       }
@@ -3020,6 +3024,7 @@ const STREAMFLOW_PROGRAM = 'strmRqUCoQUgGUan5YhzUZa6KqdzwX5L6FpUxfmKg5m';
 async function fetchStreamflowLockedAmount() {
   try {
     // Get largest token accounts for CIPHER - vesting contracts will be among top holders
+    if (heliusLimiter) await heliusLimiter.acquire();
     const res = await fetchWithRetry(HELIUS.rpc, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -3042,6 +3047,7 @@ async function fetchStreamflowLockedAmount() {
     for (let i = 0; i < Math.min(accounts.length, 20); i++) {
       const account = accounts[i];
       try {
+        if (heliusLimiter) await heliusLimiter.acquire();
         const infoRes = await fetchWithRetry(HELIUS.rpc, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -3077,6 +3083,7 @@ async function fetchStreamflowLockedAmount() {
 // Fetch token supply from Solana RPC
 async function fetchTokenSupply(mint) {
   try {
+    if (heliusLimiter) await heliusLimiter.acquire();
     const res = await fetchWithRetry(HELIUS.rpc, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -3115,6 +3122,7 @@ async function fetchStakedCipher() {
   
   try {
     // Fetch both vault balance and receipt token supply in parallel
+    if (heliusLimiter) { await heliusLimiter.acquire(); await heliusLimiter.acquire(); }
     const [vaultRes, receiptRes] = await Promise.all([
       // Vault: Actual CIPHER staked (using stake pool address as token account)
       fetchWithRetry(HELIUS.rpc, {
@@ -3317,6 +3325,7 @@ async function fetchUserStakedCipher(walletAddress) {
         log.debug(`Direct RPC: sCIPHER balance for ${walletAddress.slice(0,8)}: ${userScipherBalance}`);
       } catch (rpcErr) {
         // Final fallback to HTTP
+        if (heliusLimiter) await heliusLimiter.acquire();
         const scipherRes = await fetchWithRetry(HELIUS.rpc, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -4010,6 +4019,7 @@ function formatLiquidityHistory(poolId) {
 // ═══════════════════════════════════════════════════════════════════════════════
 let orbitWs = null;
 let orbitWsRunning = false;
+let shutdownRequested = false;
 const activeIntervals = [];
 const activeCronJobs = [];
 let healthServer = null;
@@ -4018,6 +4028,7 @@ let orbitWsReconnectAttempts = 0;
 let orbitWsPingInterval = null;
 let heliusWsReconnectAttempts = 0;
 let heliusWsPingInterval = null;
+const MAX_WS_RECONNECT_ATTEMPTS = 50; // ~4 hours at max backoff (5 min intervals)
 
 function getReconnectDelay(attempts) {
   // Exponential backoff: 15s, 30s, 60s, 120s, max 5 minutes
@@ -4046,6 +4057,7 @@ async function connectOrbitWs() {
     const ticket = ticketData?.ticket;
     if (!ticket) {
       log.warn('⚠️ No WS ticket, will retry...');
+      if (orbitWsReconnectAttempts >= MAX_WS_RECONNECT_ATTEMPTS) { log.error('❌ Orbit WS max reconnect attempts reached, giving up'); return; }
       setTimeout(connectOrbitWs, getReconnectDelay(orbitWsReconnectAttempts++));
       return;
     }
@@ -4084,15 +4096,24 @@ async function connectOrbitWs() {
     orbitWs.on('close', () => {
       log.warn('❌ Orbit WS closed');
       if (orbitWsPingInterval) { clearInterval(orbitWsPingInterval); orbitWsPingInterval = null; }
-      if (orbitWsRunning) setTimeout(connectOrbitWs, getReconnectDelay(orbitWsReconnectAttempts++));
+      if (orbitWsRunning && orbitWsReconnectAttempts < MAX_WS_RECONNECT_ATTEMPTS) {
+        setTimeout(connectOrbitWs, getReconnectDelay(orbitWsReconnectAttempts++));
+      } else if (orbitWsReconnectAttempts >= MAX_WS_RECONNECT_ATTEMPTS) {
+        log.error('❌ Orbit WS max reconnect attempts reached, giving up');
+      }
     });
 
     orbitWs.on('error', (e) => {
       log.error('⚠️ Orbit WS error:', e.message);
+      if (orbitWsPingInterval) { clearInterval(orbitWsPingInterval); orbitWsPingInterval = null; }
     });
   } catch (e) {
     log.error('⚠️ Orbit WS connect failed:', e.message);
-    setTimeout(connectOrbitWs, getReconnectDelay(orbitWsReconnectAttempts++));
+    if (orbitWsReconnectAttempts < MAX_WS_RECONNECT_ATTEMPTS) {
+      setTimeout(connectOrbitWs, getReconnectDelay(orbitWsReconnectAttempts++));
+    } else {
+      log.error('❌ Orbit WS max reconnect attempts reached, giving up');
+    }
   }
 }
 
@@ -4254,7 +4275,7 @@ function processTrade(msg) {
   // Log for debugging
   log.info(`📊 Trade: ${pool.pairName} ${isBuy ? 'BUY' : 'SELL'} $${usd.toFixed(0)} [${sig.slice(0,8)}...]`);
   
-  broadcastTradeAlert({ pool, trade, usd, isBuy, sig });
+  broadcastTradeAlert({ pool, trade, usd, isBuy, sig }).catch(e => log.debug('Trade alert failed:', e.message));
   cleanSeenTxs();
 }
 
@@ -4316,7 +4337,7 @@ function processLpEvent(msg) {
     wallet: msg.wallet || msg.user || msg.owner,
   });
   
-  broadcastLpAlert({ pool, isAdd, usd, sig, msg });
+  broadcastLpAlert({ pool, isAdd, usd, sig, msg }).catch(e => log.debug('LP alert failed:', e.message));
   cleanSeenTxs();
 }
 
@@ -4355,14 +4376,21 @@ function persistSeenTx(sig) {
   } catch (e) { log.debug('persistSeenTx error:', e.message); }
 }
 
-// Clean up stale price cache entries (older than 30 minutes)
+// Clean up stale price cache entries (older than 30 minutes) and enforce size cap
 function cleanPriceCache() {
   const maxAge = 30 * 60 * 1000; // 30 minutes
+  const maxSize = 20000;
   const now = Date.now();
   for (const [mint, data] of priceCache.entries()) {
     if (now - data.updatedAt > maxAge) {
       priceCache.delete(mint);
     }
+  }
+  // Evict oldest entries if cache still too large
+  if (priceCache.size > maxSize) {
+    const sorted = [...priceCache.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+    const toRemove = sorted.slice(0, priceCache.size - maxSize);
+    toRemove.forEach(([mint]) => priceCache.delete(mint));
   }
 }
 
@@ -4462,7 +4490,8 @@ async function connectHeliusWs() {
 
     heliusWs.on('message', (data) => {
       try {
-        handleHeliusMessage(JSON.parse(data.toString()));
+        const msg = JSON.parse(data.toString());
+        handleHeliusMessage(msg).catch(e => log.debug('Helius message handler error:', e.message));
       } catch (e) {
         log.debug('Helius WS message parse error:', e.message);
       }
@@ -4472,15 +4501,24 @@ async function connectHeliusWs() {
       log.warn('❌ Helius WS closed');
       if (heliusWsPingInterval) { clearInterval(heliusWsPingInterval); heliusWsPingInterval = null; }
       currentSubscriptions.clear();
-      if (heliusWsRunning) setTimeout(connectHeliusWs, getReconnectDelay(heliusWsReconnectAttempts++));
+      if (heliusWsRunning && heliusWsReconnectAttempts < MAX_WS_RECONNECT_ATTEMPTS) {
+        setTimeout(connectHeliusWs, getReconnectDelay(heliusWsReconnectAttempts++));
+      } else if (heliusWsReconnectAttempts >= MAX_WS_RECONNECT_ATTEMPTS) {
+        log.error('❌ Helius WS max reconnect attempts reached, giving up');
+      }
     });
 
     heliusWs.on('error', (e) => {
       log.error('⚠️ Helius WS error:', e.message);
+      if (heliusWsPingInterval) { clearInterval(heliusWsPingInterval); heliusWsPingInterval = null; }
     });
   } catch (e) {
     log.error('⚠️ Helius WS connect failed:', e.message);
-    setTimeout(connectHeliusWs, getReconnectDelay(heliusWsReconnectAttempts++));
+    if (heliusWsReconnectAttempts < MAX_WS_RECONNECT_ATTEMPTS) {
+      setTimeout(connectHeliusWs, getReconnectDelay(heliusWsReconnectAttempts++));
+    } else {
+      log.error('❌ Helius WS max reconnect attempts reached, giving up');
+    }
   }
 }
 
@@ -7653,8 +7691,9 @@ bot.action('quiet:off', async (ctx) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.action(/^browse:(\d+)$/, async (ctx) => {
   await safeAnswer(ctx);
+  const page = Math.min(parseInt(ctx.match[1]) || 0, 500);
   const user = getUser(ctx.chat.id);
-  await safeEdit(ctx, `💎 *Browse Pools*\n\nTap to add to your watchlist:`, { parse_mode: 'Markdown', ...menu.browse(parseInt(ctx.match[1]), user) });
+  await safeEdit(ctx, `💎 *Browse Pools*\n\nTap to add to your watchlist:`, { parse_mode: 'Markdown', ...menu.browse(page, user) });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -7808,6 +7847,7 @@ bot.action(/^rm:pool:([^:]+):browse:(\d+)$/, async (ctx) => {
 
 bot.action(/^add:pool:([^:]+):alert$/, async (ctx) => {
   const poolId = ctx.match[1];
+  if (!isValidMint(poolId)) return safeAnswer(ctx, '❌ Invalid pool');
   const user = getUser(ctx.chat.id);
   if (user) {
     user.watchlist = user.watchlist || [];
@@ -7824,6 +7864,7 @@ bot.action(/^add:pool:([^:]+):alert$/, async (ctx) => {
 
 bot.action(/^add:pool:([^:]+)$/, async (ctx) => {
   const poolId = ctx.match[1];
+  if (!isValidMint(poolId)) return safeAnswer(ctx, '❌ Invalid pool');
   const user = getUser(ctx.chat.id);
   if (user) {
     user.watchlist = user.watchlist || [];
@@ -7855,6 +7896,7 @@ bot.action(/^rm:pool:(.+)$/, async (ctx) => {
 
 bot.action(/^add:token:(.+)$/, async (ctx) => {
   const mint = ctx.match[1];
+  if (!isValidMint(mint)) return safeAnswer(ctx, '❌ Invalid token');
   const user = getUser(ctx.chat.id);
   if (user) {
     user.trackedTokens = user.trackedTokens || [];
@@ -7878,6 +7920,7 @@ bot.action(/^rm:token:(.+)$/, async (ctx) => {
 
 bot.action(/^addall:(.+)$/, async (ctx) => {
   const mint = ctx.match[1];
+  if (!isValidMint(mint)) return safeAnswer(ctx, '❌ Invalid token');
   const user = getUser(ctx.chat.id);
   const tokenPools = findPoolsByToken(mint);
   if (user) {
@@ -7901,6 +7944,7 @@ bot.action(/^addall:(.+)$/, async (ctx) => {
 bot.action(/^view:wallet:(.+)$/, async (ctx) => {
   await safeAnswer(ctx);
   const wallet = ctx.match[1];
+  if (!isValidWallet(wallet)) return;
   await safeEdit(ctx, `👛 *Whale Wallet*\n\n\`${wallet}\`\n\n_Tracking activity from this wallet_`, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
@@ -7918,7 +7962,7 @@ bot.action(/^view:wallet:(.+)$/, async (ctx) => {
 bot.action(/^confirm:rmwhale:(.+)$/, async (ctx) => {
   await safeAnswer(ctx);
   const wallet = ctx.match[1];
-
+  if (!isValidWallet(wallet)) return;
   await safeEdit(ctx, `⚠️ *Remove Whale Wallet?*\n\n\`${wallet}\`\n\nYou'll stop receiving alerts for this wallet.`, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
@@ -9027,6 +9071,7 @@ async function start() {
       const lastSync = user.portfolio?.lastSync || 0;
       const recentlyActive = user.lastActive && (now - user.lastActive < 30 * 60 * 1000);
       
+      if (shutdownRequested) break;
       if (hasWallets && recentlyActive && (now - lastSync > CONFIG.portfolioAutoSyncInterval)) {
         try {
           await syncPortfolio(user.chatId);
@@ -9184,13 +9229,15 @@ process.on('uncaughtException', (error) => {
 
 // Graceful shutdown function
 async function gracefulShutdown(signal) {
+  if (shutdownRequested) return; // Prevent double shutdown
+  shutdownRequested = true;
   log.info(`\n🛑 Received ${signal}. Shutting down gracefully...`);
 
-  // Force exit after 10 seconds if shutdown hangs
+  // Force exit after 30 seconds if shutdown hangs
   const shutdownTimer = setTimeout(() => {
-    log.error('Shutdown timed out after 10s, forcing exit');
+    log.error('Shutdown timed out after 30s, forcing exit');
     process.exit(1);
-  }, 10000);
+  }, 30000);
   shutdownTimer.unref();
 
   // Stop accepting new connections
@@ -9202,9 +9249,12 @@ async function gracefulShutdown(signal) {
   activeCronJobs.forEach(job => job.stop());
   log.info(`✅ Cleared ${activeIntervals.length} intervals and ${activeCronJobs.length} cron jobs`);
 
+  // Brief pause to let in-flight interval callbacks finish
+  await new Promise(r => setTimeout(r, 2000));
+
   // Close health server
   if (healthServer) {
-    healthServer.close();
+    await new Promise(resolve => healthServer.close(resolve));
     log.info('✅ Health server closed');
   }
 
