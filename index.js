@@ -1042,11 +1042,14 @@ async function fetchPrices() {
         if (data?.data) {
           for (const [key, info] of Object.entries(data.data)) {
             if (info?.price) {
-              priceCache.set(info.id || key, {
-                price: parseFloat(info.price),
-                updatedAt: Date.now(),
-                source: 'jupiter',
-              });
+              const p = parseFloat(info.price);
+              if (!isNaN(p)) {
+                priceCache.set(info.id || key, {
+                  price: p,
+                  updatedAt: Date.now(),
+                  source: 'jupiter',
+                });
+              }
             }
           }
         }
@@ -1448,8 +1451,8 @@ function checkCooldown(chatId) {
   return true;
 }
 
-// Clean up old cooldown entries periodically
-setInterval(() => {
+// Clean up old cooldown entries periodically (tracked for shutdown cleanup)
+const cooldownCleanupInterval = setInterval(() => {
   const now = Date.now();
   for (const [chatId, timestamp] of commandCooldowns.entries()) {
     if (now - timestamp > 60000) { // 1 minute
@@ -2238,7 +2241,8 @@ async function fetchPools() {
   try {
     const res = await fetchWithRetry(ORBIT.pools());
     const data = await res.json();
-    const raw = Array.isArray(data) ? data : (data.pools || data.pairs || Object.values(data)[0] || []);
+    const candidate = Array.isArray(data) ? data : (data.pools || data.pairs || Object.values(data)[0] || []);
+    const raw = Array.isArray(candidate) ? candidate : [];
     
     pools = raw.map(p => ({
       ...p,
@@ -2623,7 +2627,13 @@ async function fetchWalletOrbitTrades(wallet, limit = 50) {
     // Fallback to HTTP API
     if (txs.length === 0) {
       const res = await fetchWithRetry(`${HELIUS.api}/addresses/${wallet}/transactions?api-key=${CONFIG.heliusKey}&limit=${limit}`);
-      txs = await res.json();
+      try {
+        const parsed = await res.json();
+        txs = Array.isArray(parsed) ? parsed : [];
+      } catch (e) {
+        log.debug('Helius TX JSON parse failed:', e.message);
+        txs = [];
+      }
     }
     
     const orbitTrades = [];
@@ -3877,13 +3887,13 @@ async function fetchOHLCVData(poolId, timeframe = '1h', limit = 48) {
     
     if (Array.isArray(data) && data.length > 0) {
       return data.map(c => ({
-        time: c.time || c.timestamp || c.t,
+        time: c.time || c.timestamp || c.t || 0,
         open: parseFloat(c.open || c.o) || 0,
         high: parseFloat(c.high || c.h) || 0,
         low: parseFloat(c.low || c.l) || 0,
         close: parseFloat(c.close || c.c) || 0,
         volume: parseFloat(c.volume || c.v) || 0,
-      })).sort((a, b) => a.time - b.time);
+      })).filter(c => c.time > 0).sort((a, b) => a.time - b.time);
     }
     
     return [];
@@ -4022,6 +4032,11 @@ let orbitWsRunning = false;
 let shutdownRequested = false;
 const activeIntervals = [];
 const activeCronJobs = [];
+const pendingReconnectTimers = [];
+function scheduleReconnect(fn, delay) {
+  const id = setTimeout(fn, delay);
+  pendingReconnectTimers.push(id);
+}
 let healthServer = null;
 const seenTxs = new Set();
 let orbitWsReconnectAttempts = 0;
@@ -4058,7 +4073,7 @@ async function connectOrbitWs() {
     if (!ticket) {
       log.warn('⚠️ No WS ticket, will retry...');
       if (orbitWsReconnectAttempts >= MAX_WS_RECONNECT_ATTEMPTS) { log.error('❌ Orbit WS max reconnect attempts reached, giving up'); return; }
-      setTimeout(connectOrbitWs, getReconnectDelay(orbitWsReconnectAttempts++));
+      scheduleReconnect(connectOrbitWs, getReconnectDelay(orbitWsReconnectAttempts++));
       return;
     }
 
@@ -4075,12 +4090,21 @@ async function connectOrbitWs() {
           log.debug('Orbit WS subscribe error:', e.message);
         }
       });
-      // Keepalive ping every 30 seconds to detect zombie connections
+      // Keepalive ping every 30s with pong timeout detection
+      let orbitPongReceived = true;
       orbitWsPingInterval = setInterval(() => {
         if (orbitWs?.readyState === WebSocket.OPEN) {
+          if (!orbitPongReceived) {
+            log.warn('⚠️ Orbit WS pong timeout — force closing');
+            try { orbitWs.terminate(); } catch (e) {}
+            return;
+          }
+          orbitPongReceived = false;
           try { orbitWs.ping(); } catch (e) { /* will trigger close */ }
         }
       }, 30000);
+
+      orbitWs.on('pong', () => { orbitPongReceived = true; });
     });
 
     orbitWs.on('message', (data) => {
@@ -4091,13 +4115,11 @@ async function connectOrbitWs() {
       }
     });
 
-    orbitWs.on('pong', () => { /* Connection is alive */ });
-
     orbitWs.on('close', () => {
       log.warn('❌ Orbit WS closed');
       if (orbitWsPingInterval) { clearInterval(orbitWsPingInterval); orbitWsPingInterval = null; }
       if (orbitWsRunning && orbitWsReconnectAttempts < MAX_WS_RECONNECT_ATTEMPTS) {
-        setTimeout(connectOrbitWs, getReconnectDelay(orbitWsReconnectAttempts++));
+        scheduleReconnect(connectOrbitWs, getReconnectDelay(orbitWsReconnectAttempts++));
       } else if (orbitWsReconnectAttempts >= MAX_WS_RECONNECT_ATTEMPTS) {
         log.error('❌ Orbit WS max reconnect attempts reached, giving up');
       }
@@ -4110,7 +4132,7 @@ async function connectOrbitWs() {
   } catch (e) {
     log.error('⚠️ Orbit WS connect failed:', e.message);
     if (orbitWsReconnectAttempts < MAX_WS_RECONNECT_ATTEMPTS) {
-      setTimeout(connectOrbitWs, getReconnectDelay(orbitWsReconnectAttempts++));
+      scheduleReconnect(connectOrbitWs, getReconnectDelay(orbitWsReconnectAttempts++));
     } else {
       log.error('❌ Orbit WS max reconnect attempts reached, giving up');
     }
@@ -4441,7 +4463,7 @@ async function connectHeliusWs() {
 
   const wallets = getAllTrackedWallets();
   if (wallets.length === 0) {
-    setTimeout(connectHeliusWs, 30000);
+    scheduleReconnect(connectHeliusWs, 30000);
     return;
   }
 
@@ -4464,12 +4486,21 @@ async function connectHeliusWs() {
       log.info(`✅ Helius WS connected (${wallets.length} wallets)`);
       heliusWsReconnectAttempts = 0;
 
-      // Keepalive ping every 30s to detect zombie connections
+      // Keepalive ping every 30s with pong timeout detection
+      let heliusPongReceived = true;
       heliusWsPingInterval = setInterval(() => {
         if (heliusWs?.readyState === WebSocket.OPEN) {
+          if (!heliusPongReceived) {
+            log.warn('⚠️ Helius WS pong timeout — force closing');
+            try { heliusWs.terminate(); } catch (e) {}
+            return;
+          }
+          heliusPongReceived = false;
           try { heliusWs.ping(); } catch (e) { /* will trigger close */ }
         }
       }, 30000);
+
+      heliusWs.on('pong', () => { heliusPongReceived = true; });
 
       wallets.forEach(wallet => {
         if (!currentSubscriptions.has(wallet)) {
@@ -4502,7 +4533,7 @@ async function connectHeliusWs() {
       if (heliusWsPingInterval) { clearInterval(heliusWsPingInterval); heliusWsPingInterval = null; }
       currentSubscriptions.clear();
       if (heliusWsRunning && heliusWsReconnectAttempts < MAX_WS_RECONNECT_ATTEMPTS) {
-        setTimeout(connectHeliusWs, getReconnectDelay(heliusWsReconnectAttempts++));
+        scheduleReconnect(connectHeliusWs, getReconnectDelay(heliusWsReconnectAttempts++));
       } else if (heliusWsReconnectAttempts >= MAX_WS_RECONNECT_ATTEMPTS) {
         log.error('❌ Helius WS max reconnect attempts reached, giving up');
       }
@@ -4515,7 +4546,7 @@ async function connectHeliusWs() {
   } catch (e) {
     log.error('⚠️ Helius WS connect failed:', e.message);
     if (heliusWsReconnectAttempts < MAX_WS_RECONNECT_ATTEMPTS) {
-      setTimeout(connectHeliusWs, getReconnectDelay(heliusWsReconnectAttempts++));
+      scheduleReconnect(connectHeliusWs, getReconnectDelay(heliusWsReconnectAttempts++));
     } else {
       log.error('❌ Helius WS max reconnect attempts reached, giving up');
     }
@@ -4729,7 +4760,7 @@ async function processWalletTransaction(signature) {
     
     const usdValue = estimateWalletTxUsd(tx) / 2; // Divide by 2: estimateWalletTxUsd sums both sides of a swap
 
-    broadcastWalletAlert({ wallet: walletAddr, signature, tokenSymbol, isBuy, usdValue });
+    broadcastWalletAlert({ wallet: walletAddr, signature, tokenSymbol, isBuy, usdValue }).catch(e => log.debug('Wallet alert failed:', e.message));
   } catch (e) {
     log.error('⚠️ Wallet tx parse failed:', e.message);
   }
@@ -9217,7 +9248,7 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 // Global error handler for uncaught exceptions
-process.on('uncaughtException', (error) => {
+process.once('uncaughtException', (error) => {
   log.error('❌ Uncaught Exception:', error);
   // Save user data before potential crash
   try { saveUsers(); } catch (e) {}
@@ -9246,8 +9277,10 @@ async function gracefulShutdown(signal) {
 
   // Clear all intervals and cron jobs
   activeIntervals.forEach(id => clearInterval(id));
+  clearInterval(cooldownCleanupInterval);
+  pendingReconnectTimers.forEach(id => clearTimeout(id));
   activeCronJobs.forEach(job => job.stop());
-  log.info(`✅ Cleared ${activeIntervals.length} intervals and ${activeCronJobs.length} cron jobs`);
+  log.info(`✅ Cleared ${activeIntervals.length + 1} intervals and ${activeCronJobs.length} cron jobs`);
 
   // Brief pause to let in-flight interval callbacks finish
   await new Promise(r => setTimeout(r, 2000));
@@ -9273,8 +9306,23 @@ async function gracefulShutdown(signal) {
     }
   } catch (e) {}
   
-  // Save all pending data
+  // Clear pending debounced save timer to prevent writes after db.close()
+  if (saveTimeout) { clearTimeout(saveTimeout); saveTimeout = null; }
+
+  // Save all pending data (including anything that was queued in pendingSaves)
   try {
+    // Flush any pending debounced saves first
+    if (pendingSaves.size > 0) {
+      const batch = new Set(pendingSaves);
+      pendingSaves.clear();
+      const transaction = db.transaction(() => {
+        for (const chatId of batch) {
+          const u = users.get(chatId);
+          if (u) saveUser(u);
+        }
+      });
+      transaction();
+    }
     saveUsers();
     log.info('💾 User data saved');
   } catch (e) {
@@ -9284,8 +9332,9 @@ async function gracefulShutdown(signal) {
   // Close database connection
   try {
     if (db) {
+      db.pragma('wal_checkpoint(TRUNCATE)');
       db.close();
-      log.info('✅ Database closed');
+      log.info('✅ Database closed (WAL checkpointed)');
     }
   } catch (e) {
     log.error('Failed to close database:', e.message);
