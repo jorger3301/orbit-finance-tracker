@@ -936,7 +936,7 @@ function debounce(fn, delay) {
   let pendingPromise = null;
   let pendingResolve = null;
 
-  return function(...args) {
+  const debounced = function(...args) {
     // Don't reset timer — prevents starvation from rapid calls
     if (!pendingPromise) {
       pendingPromise = new Promise(resolve => {
@@ -956,6 +956,14 @@ function debounce(fn, delay) {
 
     return pendingPromise;
   };
+
+  debounced.cancel = () => {
+    if (timeoutId) { clearTimeout(timeoutId); timeoutId = null; }
+    pendingPromise = null;
+    pendingResolve = null;
+  };
+
+  return debounced;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -4771,26 +4779,6 @@ async function processWalletTransaction(signature) {
 // ═══════════════════════════════════════════════════════════════════════════════
 const bot = new Telegraf(CONFIG.botToken);
 
-// User-friendly error messages
-const ERROR_MESSAGES = {
-  network: '⚠️ Network issue. Please try again.',
-  timeout: '⚠️ Request timed out. Please try again.',
-  rateLimit: '⚠️ Too many requests. Please wait a moment.',
-  notFound: '⚠️ Not found. Please check and try again.',
-  unknown: '⚠️ Something went wrong. Please try again.',
-};
-
-function getUserFriendlyError(error) {
-  const msg = error?.message?.toLowerCase() || '';
-  const desc = error?.description?.toLowerCase() || '';
-  
-  if (msg.includes('timeout') || msg.includes('timed out')) return ERROR_MESSAGES.timeout;
-  if (msg.includes('network') || msg.includes('econnrefused')) return ERROR_MESSAGES.network;
-  if (msg.includes('429') || desc.includes('too many')) return ERROR_MESSAGES.rateLimit;
-  if (msg.includes('404') || msg.includes('not found')) return ERROR_MESSAGES.notFound;
-  return ERROR_MESSAGES.unknown;
-}
-
 // Safe messaging utilities - handle Telegram API errors gracefully
 const safeAnswer = async (ctx, text) => {
   try { await ctx.answerCbQuery(text); } catch (e) { log.debug('Answer failed:', e.message); }
@@ -5141,12 +5129,15 @@ const menu = {
     ]);
   },
   
-  history: (u) => {
+  history: (u, page = 0) => {
     const btns = [];
     const alerts = u?.recentAlerts || [];
-    
-    if (alerts.length > 0) {
-      alerts.slice(0, 5).forEach((a) => {
+    const perPage = 5;
+    const start = page * perPage;
+    const pageAlerts = alerts.slice(start, start + perPage);
+
+    if (pageAlerts.length > 0) {
+      pageAlerts.forEach((a) => {
         let icon = '💧';
         if (a.type === 'trade') icon = a.isBuy ? '🟢' : '🔴';
         else if (a.type === 'wallet') icon = '🐋';
@@ -5167,7 +5158,17 @@ const menu = {
         }
       });
     }
-    
+
+    // Pagination buttons
+    const totalPages = Math.ceil(alerts.length / perPage);
+    if (totalPages > 1) {
+      const navRow = [];
+      if (page > 0) navRow.push(Markup.button.callback('« Prev', `history:page:${page - 1}`));
+      navRow.push(Markup.button.callback(`${page + 1}/${totalPages}`, 'noop_alert'));
+      if (page < totalPages - 1) navRow.push(Markup.button.callback('Next »', `history:page:${page + 1}`));
+      btns.push(navRow);
+    }
+
     btns.push([Markup.button.callback('🏠 Menu', 'nav:main')]);
     return Markup.inlineKeyboard(btns);
   },
@@ -5255,9 +5256,9 @@ const menu = {
     return Markup.inlineKeyboard(btns);
   },
   
-  confirm: (action, label) => Markup.inlineKeyboard([
+  confirm: (action, label, cancelNav = 'nav:main') => Markup.inlineKeyboard([
     [Markup.button.callback(`✅ Yes, ${label}`, `do:${action}`)],
-    [Markup.button.callback('❌ Cancel', 'nav:main')],
+    [Markup.button.callback('❌ Cancel', cancelNav)],
   ]),
   
   alertActions: (poolId, sig) => Markup.inlineKeyboard([
@@ -5403,7 +5404,7 @@ const menu = {
 // TEXTS
 // ═══════════════════════════════════════════════════════════════════════════════
 const text = {
-  welcome: (name) => `🚀 *Orbit Tracker*${name ? `\n\nWelcome, ${name}!` : ''}
+  welcome: (name) => `🚀 *Orbit Tracker*${name ? `\n\nWelcome, ${escMd(name)}!` : ''}
 
 Your complete Orbit Finance companion.
 
@@ -5441,7 +5442,7 @@ Your complete Orbit Finance companion.
       portfolioLine = `\n📈 Portfolio: ${fmt(netWorth)} • ${pnlIcon} ${pnl >= 0 ? '+' : '-'}${fmt(Math.abs(pnl))} PnL`;
     }
 
-    const greeting = name ? `\nWelcome back, ${name}!` : '';
+    const greeting = name ? `\nWelcome back, ${escMd(name)}!` : '';
 
     return `📊 *Dashboard*${greeting}
 
@@ -5688,14 +5689,17 @@ Temporarily pause alerts or set up quiet hours.`;
 Set hours when you don't want to receive alerts (all times in UTC).${current}`;
   },
   
-  history: (u) => {
+  history: (u, page = 0) => {
     const count = u?.recentAlerts?.length || 0;
     if (count === 0) return `📜 *Recent Alerts*
 
 No alerts yet. They'll appear here as you receive them.`;
-    return `📜 *Recent Alerts*
+    const perPage = 5;
+    const totalPages = Math.ceil(count / perPage);
+    const pageInfo = totalPages > 1 ? ` (page ${page + 1}/${totalPages})` : '';
+    return `📜 *Recent Alerts*${pageInfo}
 
-Your last ${count} alert${count !== 1 ? 's' : ''}. Tap to view on Solscan.`;
+${count} alert${count !== 1 ? 's' : ''}. Tap to view on Solscan.`;
   },
   
   settings: (u) => {
@@ -6242,7 +6246,7 @@ bot.command('help', async (ctx) => {
       ])
     });
   } catch (e) {
-    try { await ctx.reply('❌ Failed to load help. Try /start'); } catch (e2) {}
+    try { await ctx.reply('❌ Failed to load help.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) }); } catch (e2) {}
   }
 });
 
@@ -6464,7 +6468,7 @@ _Member since: ${new Date(user.createdAt || Date.now()).toLocaleDateString('en-U
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.command('leaderboard', async (ctx) => {
   if (!checkCooldown(ctx.chat.id)) {
-    return await ctx.reply('⏳ Too fast! Try again in a second.');
+    return await ctx.reply('⏳ Too fast! Try again in a second.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
   
   try {
@@ -6553,7 +6557,7 @@ bot.action(/^leaderboard:(.+)$/, async (ctx) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.command('chart', async (ctx) => {
   if (!checkCooldown(ctx.chat.id)) {
-    return await ctx.reply('⏳ Too fast! Try again in a second.');
+    return await ctx.reply('⏳ Too fast! Try again in a second.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
   
   try {
@@ -6588,7 +6592,10 @@ bot.command('chart', async (ctx) => {
     }
     
     if (!pool) {
-      return await ctx.reply(`❌ Pool not found: ${poolIdOrSymbol}\n\nUsage: \`/chart [pool] [timeframe]\`\nTimeframes: 15m, 1h, 4h, 1d\n\nExamples:\n• /chart\n• /chart CIPHER 1h`, { parse_mode: 'Markdown' });
+      const errMsg = poolIdOrSymbol
+        ? `❌ Pool not found: ${escMd(poolIdOrSymbol)}\n\nUsage: \`/chart [pool] [timeframe]\``
+        : `❌ No pools loaded yet. Please try again shortly.`;
+      return await ctx.reply(errMsg, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
     }
     
     const chartLoadingMsg = await ctx.reply('📊 *Generating chart...*', { parse_mode: 'Markdown' });
@@ -6828,7 +6835,7 @@ bot.action(/^chart:([1-9A-HJ-NP-Za-km-z]{32,44})$/, async (ctx) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 bot.command('liquidity', async (ctx) => {
   if (!checkCooldown(ctx.chat.id)) {
-    return await ctx.reply('⏳ Too fast! Try again in a second.');
+    return await ctx.reply('⏳ Too fast! Try again in a second.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
   
   try {
@@ -6850,7 +6857,10 @@ bot.command('liquidity', async (ctx) => {
     }
     
     if (!pool) {
-      return await ctx.reply(`❌ Pool not found.\n\nUsage: \`/liquidity [pool]\``, { parse_mode: 'Markdown' });
+      const errMsg = poolIdOrSymbol
+        ? `❌ Pool not found.\n\nUsage: \`/liquidity [pool]\``
+        : `❌ No pools loaded yet. Please try again shortly.`;
+      return await ctx.reply(errMsg, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
     }
     
     const message = formatLiquidityHistory(pool.id);
@@ -6975,7 +6985,7 @@ bot.action('leaderboard:cipher', async (ctx) => {
     });
   } catch (e) {
     log.error('Leaderboard cipher shortcut error:', e);
-    await ctx.reply('❌ Failed to load leaderboard.');
+    await ctx.reply('❌ Failed to load leaderboard.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) });
   }
 });
 
@@ -7160,10 +7170,14 @@ bot.action(/^pool:watch:(.+)$/, async (ctx) => {
     user.watchlist.splice(index, 1);
     await safeAnswer(ctx, '⭐ Removed from watchlist');
   } else {
+    const totalItems = (user.watchlist.length) + (user.trackedTokens?.length || 0);
+    if (totalItems >= CONFIG.maxWatchlistItems) {
+      return safeAnswer(ctx, `Watchlist full (${CONFIG.maxWatchlistItems} max)`);
+    }
     user.watchlist.push(poolId);
     await safeAnswer(ctx, '⭐ Added to watchlist!');
   }
-  
+
   saveUsersDebounced();
   
   // Refresh the view
@@ -7213,7 +7227,14 @@ bot.action('nav:quiet', async (ctx) => {
 bot.action('nav:history', async (ctx) => {
   await safeAnswer(ctx);
   const user = getUser(ctx.chat.id);
-  await safeEdit(ctx, text.history(user), { parse_mode: 'Markdown', ...menu.history(user) });
+  await safeEdit(ctx, text.history(user, 0), { parse_mode: 'Markdown', ...menu.history(user, 0) });
+});
+
+bot.action(/^history:page:(\d+)$/, async (ctx) => {
+  await safeAnswer(ctx);
+  const page = parseInt(ctx.match[1]);
+  const user = getUser(ctx.chat.id);
+  await safeEdit(ctx, text.history(user, page), { parse_mode: 'Markdown', ...menu.history(user, page) });
 });
 
 bot.action('nav:settings', async (ctx) => {
@@ -7749,12 +7770,12 @@ bot.action('input:search', async (ctx) => {
 
 bot.action('confirm:resetstats', async (ctx) => {
   await safeAnswer(ctx);
-  await safeEdit(ctx, `⚠️ *Reset Statistics?*\n\nThis will clear all your stats and history.`, { parse_mode: 'Markdown', ...menu.confirm('resetstats', 'reset everything') });
+  await safeEdit(ctx, `⚠️ *Reset Statistics?*\n\nThis will clear all your stats and history.`, { parse_mode: 'Markdown', ...menu.confirm('resetstats', 'reset everything', 'nav:settings') });
 });
 
 bot.action('confirm:clearwatchlist', async (ctx) => {
   await safeAnswer(ctx);
-  await safeEdit(ctx, `⚠️ *Clear Watchlist?*\n\nThis will remove all items from your watchlist.`, { parse_mode: 'Markdown', ...menu.confirm('clearwatchlist', 'clear all') });
+  await safeEdit(ctx, `⚠️ *Clear Watchlist?*\n\nThis will remove all items from your watchlist.`, { parse_mode: 'Markdown', ...menu.confirm('clearwatchlist', 'clear all', 'nav:watchlist') });
 });
 
 bot.action(/^do:rmwallet:(.+)$/, async (ctx) => {
@@ -7882,6 +7903,10 @@ bot.action(/^add:pool:([^:]+):alert$/, async (ctx) => {
   const user = getUser(ctx.chat.id);
   if (user) {
     user.watchlist = user.watchlist || [];
+    const totalItems = (user.watchlist.length) + (user.trackedTokens?.length || 0);
+    if (totalItems >= CONFIG.maxWatchlistItems) {
+      return safeAnswer(ctx, `Watchlist full (${CONFIG.maxWatchlistItems} max)`);
+    }
     if (!user.watchlist.includes(poolId)) {
       user.watchlist.push(poolId);
       saveUsersDebounced();  // Debounced for performance
@@ -7931,6 +7956,10 @@ bot.action(/^add:token:(.+)$/, async (ctx) => {
   const user = getUser(ctx.chat.id);
   if (user) {
     user.trackedTokens = user.trackedTokens || [];
+    const totalItems = (user.watchlist?.length || 0) + (user.trackedTokens.length);
+    if (totalItems >= CONFIG.maxWatchlistItems) {
+      return safeAnswer(ctx, `Watchlist full (${CONFIG.maxWatchlistItems} max)`);
+    }
     if (!user.trackedTokens.includes(mint)) user.trackedTokens.push(mint);
     saveUsersDebounced();  // Debounced for performance
   }
@@ -7957,7 +7986,10 @@ bot.action(/^addall:(.+)$/, async (ctx) => {
   if (user) {
     user.watchlist = user.watchlist || [];
     let added = 0;
-    tokenPools.forEach(p => { 
+    const maxItems = CONFIG.maxWatchlistItems;
+    tokenPools.forEach(p => {
+      const totalItems = (user.watchlist.length) + (user.trackedTokens?.length || 0);
+      if (totalItems >= maxItems) return;
       if (!user.watchlist.includes(p.id)) {
         user.watchlist.push(p.id);
         added++;
@@ -8083,7 +8115,8 @@ bot.action(/^view:pool:(.+)$/, async (ctx) => {
     ...Markup.inlineKeyboard([
       [Markup.button.callback('📊 Chart', `chart:${poolId}:1h`),
        Markup.button.callback('💧 LP History', `liqhistory:${poolId}`)],
-      [Markup.button.callback(inList ? '❌ Remove from Watchlist' : '➕ Add to Watchlist', inList ? `confirm:rmpool:${poolId}` : `add:pool:${poolId}`)],
+      [Markup.button.callback('🏆 Leaderboard', `leaderboard:${baseMint}`),
+       Markup.button.callback(inList ? '❌ Remove' : '➕ Add Watchlist', inList ? `confirm:rmpool:${poolId}` : `add:pool:${poolId}`)],
       [
         Markup.button.url('🔍 Solscan', `https://solscan.io/account/${poolId}`),
         Markup.button.url('🦅 Birdeye', `https://birdeye.so/token/${baseMint}?chain=solana`),
@@ -8264,7 +8297,7 @@ bot.on('text', async (ctx) => {
     }
   } catch (e) {
     log.error('Text handler error:', e.message);
-    try { await ctx.reply('❌ Something went wrong. Please try again.'); } catch (e2) {}
+    try { await ctx.reply('❌ Something went wrong. Please try again.', { ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]]) }); } catch (e2) {}
   }
 });
 
@@ -8548,16 +8581,21 @@ async function broadcastLpAlert({ pool, isAdd, usd, sig, msg: originalMsg }) {
       if (!isAdd && user.cipherLpRemove && usd >= threshold) shouldSend = true;
     } else {
       if (user.trackOtherPools === false) continue;
+      const base = pool.baseMint || pool.base;
+      const quote = pool.quoteMint || pool.quote;
+      const tokenTracked = user.trackedTokens?.includes(base) || user.trackedTokens?.includes(quote);
+      const poolWatched = user.watchlist?.includes(pool.id);
+      if (!tokenTracked && !poolWatched) continue;
       const threshold = user.otherLpThreshold ?? 500;
       if (isAdd && user.otherLpAdd && usd >= threshold) shouldSend = true;
       if (!isAdd && user.otherLpRemove && usd >= threshold) shouldSend = true;
     }
-    
+
     if (shouldSend) toNotify.push(user);
   }
-  
+
   if (toNotify.length === 0) return;
-  
+
   // ═══════════════════════════════════════════════════════════════════
   // PROFESSIONAL LP ALERT FORMAT
   // ═══════════════════════════════════════════════════════════════════
@@ -9247,12 +9285,13 @@ process.on('unhandledRejection', (reason, promise) => {
   // Don't crash - just log and continue
 });
 
-// Global error handler for uncaught exceptions
-process.once('uncaughtException', (error) => {
+// Global error handler for uncaught exceptions (with counter to prevent infinite loops)
+let uncaughtCount = 0;
+process.on('uncaughtException', (error) => {
+  uncaughtCount++;
   log.error('❌ Uncaught Exception:', error);
-  // Save user data before potential crash
+  if (uncaughtCount > 3) { log.error('Too many uncaught exceptions, forcing exit'); process.exit(1); }
   try { saveUsers(); } catch (e) {}
-  // For critical errors, exit; Node.js docs recommend this
   if (error.message?.includes('FATAL') || error.code === 'ECONNREFUSED') {
     gracefulShutdown('UNCAUGHT_EXCEPTION');
   }
@@ -9291,23 +9330,23 @@ async function gracefulShutdown(signal) {
     log.info('✅ Health server closed');
   }
 
-  // Close WebSocket connections
-  try {
-    if (orbitWs && orbitWs.readyState === WebSocket.OPEN) {
-      orbitWs.close();
-      log.info('✅ Orbit WebSocket closed');
-    }
-  } catch (e) {}
-  
-  try {
-    if (heliusWs && heliusWs.readyState === WebSocket.OPEN) {
-      heliusWs.close();
-      log.info('✅ Helius WebSocket closed');
-    }
-  } catch (e) {}
-  
-  // Clear pending debounced save timer to prevent writes after db.close()
+  // Explicitly clear WS ping intervals (don't rely on close events)
+  if (orbitWsPingInterval) { clearInterval(orbitWsPingInterval); orbitWsPingInterval = null; }
+  if (heliusWsPingInterval) { clearInterval(heliusWsPingInterval); heliusWsPingInterval = null; }
+
+  // Terminate WebSocket connections regardless of state (handles CONNECTING too)
+  try { if (orbitWs) { orbitWs.removeAllListeners(); orbitWs.terminate(); log.info('✅ Orbit WebSocket terminated'); } } catch (e) {}
+  try { if (heliusWs) { heliusWs.removeAllListeners(); heliusWs.terminate(); log.info('✅ Helius WebSocket terminated'); } } catch (e) {}
+
+  // Clear all pending debounced save timers to prevent writes after db.close()
   if (saveTimeout) { clearTimeout(saveTimeout); saveTimeout = null; }
+  if (saveUsersDebounced.cancel) saveUsersDebounced.cancel();
+
+  // Stop bot FIRST so in-flight handlers finish while DB is still open
+  try {
+    await bot.stop(signal);
+    log.info('✅ Bot stopped');
+  } catch (e) {}
 
   // Save all pending data (including anything that was queued in pendingSaves)
   try {
@@ -9328,8 +9367,8 @@ async function gracefulShutdown(signal) {
   } catch (e) {
     log.error('Failed to save users:', e.message);
   }
-  
-  // Close database connection
+
+  // Close database connection (after bot stopped, so no in-flight handlers need DB)
   try {
     if (db) {
       db.pragma('wal_checkpoint(TRUNCATE)');
@@ -9340,12 +9379,6 @@ async function gracefulShutdown(signal) {
     log.error('Failed to close database:', e.message);
   }
   
-  // Stop bot
-  try {
-    await bot.stop(signal);
-    log.info('✅ Bot stopped');
-  } catch (e) {}
-  
   log.info('👋 Goodbye!');
   process.exit(0);
 }
@@ -9354,7 +9387,7 @@ process.once('SIGINT', () => gracefulShutdown('SIGINT'));
 process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 // Start the bot
-start().catch(e => { 
-  log.error('Fatal startup error:', e); 
-  process.exit(1); 
+start().catch(async (e) => {
+  log.error('Fatal startup error:', e);
+  await gracefulShutdown('STARTUP_FAILURE');
 });
