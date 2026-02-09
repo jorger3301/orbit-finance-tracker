@@ -1176,6 +1176,11 @@ function getPrice(mint) {
   return null;
 }
 
+function isPriceStale() {
+  if (lastPriceUpdate === 0) return true;
+  return Date.now() - lastPriceUpdate > 10 * 60 * 1000; // 10 minutes
+}
+
 function getSolPrice() {
   const price = getPrice(MINTS.SOL);
   if (price) return price;
@@ -1774,32 +1779,58 @@ function loadUsers() {
   
   try {
     const rows = db.prepare('SELECT * FROM users').all();
-    
+
+    // Batch-load all related tables (6 queries total instead of 5N)
+    const watchlistMap = new Map();
+    for (const r of db.prepare('SELECT chat_id, pool_id FROM watchlist').all()) {
+      if (!watchlistMap.has(r.chat_id)) watchlistMap.set(r.chat_id, []);
+      watchlistMap.get(r.chat_id).push(r.pool_id);
+    }
+    const trackedTokensMap = new Map();
+    for (const r of db.prepare('SELECT chat_id, mint FROM tracked_tokens').all()) {
+      if (!trackedTokensMap.has(r.chat_id)) trackedTokensMap.set(r.chat_id, []);
+      trackedTokensMap.get(r.chat_id).push(r.mint);
+    }
+    const whaleWalletsMap = new Map();
+    for (const r of db.prepare('SELECT chat_id, wallet FROM whale_wallets').all()) {
+      if (!whaleWalletsMap.has(r.chat_id)) whaleWalletsMap.set(r.chat_id, []);
+      whaleWalletsMap.get(r.chat_id).push(r.wallet);
+    }
+    const portfolioWalletsMap = new Map();
+    for (const r of db.prepare('SELECT chat_id, wallet FROM portfolio_wallets ORDER BY is_primary DESC').all()) {
+      if (!portfolioWalletsMap.has(r.chat_id)) portfolioWalletsMap.set(r.chat_id, []);
+      portfolioWalletsMap.get(r.chat_id).push(r.wallet);
+    }
+    const recentAlertsMap = new Map();
+    for (const r of db.prepare('SELECT * FROM recent_alerts ORDER BY time DESC').all()) {
+      if (!recentAlertsMap.has(r.chat_id)) recentAlertsMap.set(r.chat_id, []);
+      const arr = recentAlertsMap.get(r.chat_id);
+      if (arr.length < CONFIG.maxRecentAlerts) {
+        arr.push({ type: r.type, pair: r.pair, token: r.token, wallet: r.wallet, usd: r.usd, isBuy: r.is_buy === 1, sig: r.sig, time: r.time });
+      }
+    }
+
     for (const row of rows) {
       const user = dbRowToUser(row);
-      
-      // Load related data
-      user.watchlist = db.prepare('SELECT pool_id FROM watchlist WHERE chat_id = ?').all(row.chat_id).map(r => r.pool_id);
-      user.trackedTokens = db.prepare('SELECT mint FROM tracked_tokens WHERE chat_id = ?').all(row.chat_id).map(r => r.mint);
-      user.wallets = db.prepare('SELECT wallet FROM whale_wallets WHERE chat_id = ?').all(row.chat_id).map(r => r.wallet);
-      user.portfolioWallets = db.prepare('SELECT wallet FROM portfolio_wallets WHERE chat_id = ? ORDER BY is_primary DESC').all(row.chat_id).map(r => r.wallet);
-      user.recentAlerts = db.prepare('SELECT * FROM recent_alerts WHERE chat_id = ? ORDER BY time DESC LIMIT ?').all(row.chat_id, CONFIG.maxRecentAlerts).map(r => ({
-        type: r.type,
-        pair: r.pair,
-        token: r.token,
-        wallet: r.wallet,
-        usd: r.usd,
-        isBuy: r.is_buy === 1,
-        sig: r.sig,
-        time: r.time,
-      }));
-      
+      user.watchlist = watchlistMap.get(row.chat_id) || [];
+      user.trackedTokens = trackedTokensMap.get(row.chat_id) || [];
+      user.wallets = whaleWalletsMap.get(row.chat_id) || [];
+      user.portfolioWallets = portfolioWalletsMap.get(row.chat_id) || [];
+      user.recentAlerts = recentAlertsMap.get(row.chat_id) || [];
       users.set(user.chatId, user);
     }
-    
+
     log.info(`✅ Loaded ${users.size} users from database`);
   } catch (e) {
     log.error('❌ Failed to load users:', e.message);
+  }
+}
+
+function safeJsonParse(str, fallback = {}) {
+  if (!str) return fallback;
+  try { return JSON.parse(str); } catch (e) {
+    log.warn('⚠️ Corrupted JSON in DB, using fallback:', str.slice(0, 50));
+    return fallback;
   }
 }
 
@@ -1833,9 +1864,9 @@ function dbRowToUser(row) {
     quietStart: row.quiet_start,
     quietEnd: row.quiet_end,
     dailyDigest: row.daily_digest === 1,
-    stats: JSON.parse(row.stats || '{}'),
-    todayStats: JSON.parse(row.today_stats || '{}'),
-    portfolio: JSON.parse(row.portfolio || '{}'),
+    stats: safeJsonParse(row.stats),
+    todayStats: safeJsonParse(row.today_stats),
+    portfolio: safeJsonParse(row.portfolio),
     myWallet: row.my_wallet,
     createdAt: row.created_at,
     lastActive: row.last_active,
@@ -2275,9 +2306,9 @@ async function pollTradesBackup() {
       
       // Small delay between pools
       await new Promise(r => setTimeout(r, 100));
-    } catch (e) {}
+    } catch (e) { log.debug(`Poll trades error for pool ${pool.id}:`, e.message); }
   }
-  
+
   cleanSeenTxs(); // Clean up old entries
 }
 
@@ -4299,7 +4330,7 @@ function cleanSeenTxs() {
   if (db) {
     try {
       db.prepare('DELETE FROM seen_txs WHERE added_at < ?').run(Date.now() - 24 * 60 * 60 * 1000);
-    } catch (e) {}
+    } catch (e) { log.debug('cleanSeenTxs DB error:', e.message); }
   }
 }
 
@@ -4321,7 +4352,7 @@ function persistSeenTx(sig) {
   if (!db || !sig) return;
   try {
     db.prepare('INSERT OR IGNORE INTO seen_txs (sig, added_at) VALUES (?, ?)').run(sig, Date.now());
-  } catch (e) {}
+  } catch (e) { log.debug('persistSeenTx error:', e.message); }
 }
 
 // Clean up stale price cache entries (older than 30 minutes)
@@ -5767,7 +5798,7 @@ ${pnlIcon} PnL: ${pnlSign}${fmt(Math.abs(realizedPnl))}
 💰 Volume: ${fmt(totalVolume)}
 🔄 Trades: ${tradeCount}
 
-_${lastSync} UTC_`;
+_${lastSync} UTC_${isPriceStale() ? '\n\n⚠️ _Prices may be outdated_' : ''}`;
   },
   
   portfolioStats: (u) => {
@@ -6020,8 +6051,9 @@ bot.command('snooze', async (ctx) => {
 
 bot.command('cipher', async (ctx) => {
   try {
+    try { await ctx.sendChatAction('typing'); } catch (_) {}
     const loadingMsg = await ctx.reply('🔄 Loading CIPHER data...');
-    
+
     // Fetch all data in parallel
     const [overview, supplyData] = await Promise.all([
       getTokenOverview(MINTS.CIPHER),
@@ -6367,9 +6399,10 @@ bot.command('leaderboard', async (ctx) => {
   }
   
   try {
+    try { await ctx.sendChatAction('typing'); } catch (_) {}
     const args = ctx.message.text.split(' ').slice(1);
     const mintOrSymbol = args[0];
-    
+
     // Default to CIPHER if no argument
     let mint = MINTS.CIPHER;
     let symbol = 'CIPHER';
@@ -6440,7 +6473,9 @@ bot.action(/^leaderboard:(.+)$/, async (ctx) => {
       ])
     });
   } catch (e) {
-    await ctx.reply('❌ Failed to refresh leaderboard.');
+    await ctx.reply('❌ Failed to refresh leaderboard.', {
+      ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]])
+    });
   }
 });
 
@@ -6453,6 +6488,7 @@ bot.command('chart', async (ctx) => {
   }
   
   try {
+    try { await ctx.sendChatAction('typing'); } catch (_) {}
     const args = ctx.message.text.split(' ').slice(1);
     const poolIdOrSymbol = args[0];
     const timeframe = args[1] || '1h';
@@ -6569,14 +6605,17 @@ _${candles.length} candles • Updated ${fmtTime()} UTC_`;
 // Chart action (timeframe switching)
 bot.action(/^chart:(.+):(15m|1h|4h|1d)$/, async (ctx) => {
   await safeAnswer(ctx, '📊 Loading...');
-  
+
   try {
+    try { await ctx.sendChatAction('typing'); } catch (_) {}
     const poolId = ctx.match[1];
     const tf = ctx.match[2];
     
     const pool = poolMap.get(poolId);
     if (!pool) {
-      return await ctx.reply('❌ Pool not found.');
+      return await ctx.reply('❌ Pool not found.', {
+        ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]])
+      });
     }
     
     const symbol = pool.pairName;
@@ -6637,17 +6676,20 @@ _Updated ${fmtTime()} UTC_`;
     );
   } catch (e) {
     log.error('Chart action error:', e);
-    await ctx.reply('❌ Failed to update chart.');
+    await ctx.reply('❌ Failed to update chart.', {
+      ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]])
+    });
   }
 });
 
 // Chart action (from token mint)
 bot.action(/^chart:([1-9A-HJ-NP-Za-km-z]{32,44})$/, async (ctx) => {
   await safeAnswer(ctx, '📊 Loading...');
-  
+
   try {
+    try { await ctx.sendChatAction('typing'); } catch (_) {}
     const mint = ctx.match[1];
-    
+
     // Find a pool with this token
     const pool = pools.find(p => p.baseMint === mint || p.quoteMint === mint);
     
@@ -6706,7 +6748,9 @@ bot.action(/^chart:([1-9A-HJ-NP-Za-km-z]{32,44})$/, async (ctx) => {
     );
   } catch (e) {
     log.error('Chart mint action error:', e);
-    await ctx.reply('❌ Failed to generate chart.');
+    await ctx.reply('❌ Failed to generate chart.', {
+      ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu', 'nav:main')]])
+    });
   }
 });
 
@@ -7578,6 +7622,13 @@ bot.action(/^snooze:alert:(\d+)$/, async (ctx) => {
   const label = mins >= 60 ? `${mins/60}h` : `${mins}m`;
   await safeAnswer(ctx, `🔕 Snoozed for ${label}. Alerts paused.`);
   try { await ctx.editMessageReplyMarkup(undefined); } catch (_) {}
+  await ctx.reply(`🔕 Alerts snoozed for *${label}*. You won't receive alerts until the snooze ends.`, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('🔔 Unsnooze', 'snooze:off')],
+      [Markup.button.callback('🏠 Menu', 'nav:main')],
+    ])
+  });
 });
 
 bot.action(/^quiet:(\d+):(\d+)$/, async (ctx) => {
@@ -8163,7 +8214,11 @@ function getSizeTier(usd) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // DAILY DIGEST
 // ═══════════════════════════════════════════════════════════════════════════════
+let isDigestRunning = false;
 async function sendDailyDigests() {
+  if (isDigestRunning) { log.warn('⚠️ Daily digest already running, skipping'); return; }
+  isDigestRunning = true;
+  try {
   const solPrice = getPrice(MINTS.SOL);
   const cipherPrice = getPrice(MINTS.CIPHER);
   const vol24h = orbitVolumes.total24h || 0;
@@ -8171,15 +8226,24 @@ async function sendDailyDigests() {
   let sent = 0;
   let errors = 0;
   
+  // Collect eligible users into array for indexed iteration (supports i-- retry)
+  const eligible = [];
   for (const user of users.values()) {
-    // Only send to users who have enabled daily digest and aren't blocked
     if (!user.dailyDigest || user.blocked || !user.enabled) continue;
-    
+    eligible.push(user);
+  }
+
+  const retryCount = new Map();
+  const MAX_RETRIES = 3;
+
+  for (let i = 0; i < eligible.length; i++) {
+    const user = eligible[i];
+
     try {
       const stats = user.todayStats || { trades: 0, lp: 0, wallet: 0 };
       const allTimeStats = user.stats || {};
       const portfolio = user.portfolio || {};
-      
+
       // Build portfolio section if user has wallets
       let portfolioSection = '';
       if (user.portfolioWallets?.length > 0 || user.myWallet) {
@@ -8192,7 +8256,7 @@ async function sendDailyDigests() {
 ${pnlIcon} PnL: ${pnl >= 0 ? '+' : '-'}${fmt(Math.abs(pnl))}
 `;
       }
-      
+
       // Build the digest message
       const msg = `☀️ *Good Morning!*
 
@@ -8213,9 +8277,9 @@ ${portfolioSection}
 📈 Total Volume Tracked: ${fmt(allTimeStats.volume || 0)}
 🔄 Total Alerts: ${(allTimeStats.cipherBuys || 0) + (allTimeStats.cipherSells || 0) + (allTimeStats.cipherLp || 0) + (allTimeStats.otherLp || 0) + (allTimeStats.otherTrades || 0) + (allTimeStats.walletAlerts || 0) + (allTimeStats.events || 0)}
 
-_Have a great day! 🚀_`;
+_Have a great day! 🚀_${isPriceStale() ? '\n\n⚠️ _Prices may be outdated_' : ''}`;
 
-      await bot.telegram.sendMessage(user.chatId, msg, { 
+      await bot.telegram.sendMessage(user.chatId, msg, {
         parse_mode: 'Markdown',
         disable_web_page_preview: true,
         ...Markup.inlineKeyboard([
@@ -8223,19 +8287,25 @@ _Have a great day! 🚀_`;
           [Markup.button.callback('⚙️ Digest Settings', 'nav:settings')],
         ])
       });
-      
+
       sent++;
-      
+
       // Rate limit protection
       if (sent % 20 === 0) {
         await new Promise(r => setTimeout(r, 1000));
       }
-      
+
     } catch (e) {
       errors++;
       if (e.code === 429) {
-        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
-        i--; // Retry this user after rate limit delay
+        const tries = (retryCount.get(user.chatId) || 0) + 1;
+        retryCount.set(user.chatId, tries);
+        if (tries <= MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+          i--; // Retry this user
+        } else {
+          log.warn(`429 max retries exceeded for digest user ${user.chatId}, skipping`);
+        }
       } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         user.enabled = false;
         user.blocked = true;
@@ -8252,6 +8322,7 @@ _Have a great day! 🚀_`;
   saveUsersDebounced();
 
   log.info(`📬 Daily digest: sent ${sent}, errors ${errors}`);
+  } finally { isDigestRunning = false; }
 }
 
 async function broadcastTradeAlert({ pool, trade, usd, isBuy, sig }) {
@@ -8352,6 +8423,7 @@ ${size.bar} ${size.tier}
   msg += `\n⏱ ${fmtTime()} UTC • Orbit`;
 
   // Send with small delays to avoid Telegram rate limits
+  const retryCount = new Map(); const MAX_RETRIES = 3;
   for (let i = 0; i < toNotify.length; i++) {
     const user = toNotify[i];
     try {
@@ -8372,8 +8444,12 @@ ${size.bar} ${size.tier}
       if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
       if (e.code === 429) {
-        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
-        i--; // Retry this user after rate limit delay
+        const tries = (retryCount.get(user.chatId) || 0) + 1;
+        retryCount.set(user.chatId, tries);
+        if (tries <= MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+          i--;
+        }
       } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         user.enabled = false;
         user.blocked = true;
@@ -8465,6 +8541,7 @@ ${size.bar} ${size.tier}
 
 ⏱ ${fmtTime()} UTC • Orbit`;
 
+  const retryCount = new Map(); const MAX_RETRIES = 3;
   for (let i = 0; i < toNotify.length; i++) {
     const user = toNotify[i];
     try {
@@ -8482,8 +8559,12 @@ ${size.bar} ${size.tier}
       if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
       if (e.code === 429) {
-        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
-        i--; // Retry this user after rate limit delay
+        const tries = (retryCount.get(user.chatId) || 0) + 1;
+        retryCount.set(user.chatId, tries);
+        if (tries <= MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+          i--;
+        }
       } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         user.enabled = false;
         user.blocked = true;
@@ -8520,6 +8601,7 @@ ${size.bar} ${size.tier}
 
 ⏱ ${fmtTime()} UTC • Orbit`;
 
+  const retryCount = new Map(); const MAX_RETRIES = 3;
   for (let i = 0; i < toNotify.length; i++) {
     const user = toNotify[i];
     try {
@@ -8537,8 +8619,12 @@ ${size.bar} ${size.tier}
       if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
       if (e.code === 429) {
-        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
-        i--; // Retry this user after rate limit delay
+        const tries = (retryCount.get(user.chatId) || 0) + 1;
+        retryCount.set(user.chatId, tries);
+        if (tries <= MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+          i--;
+        }
       } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         user.enabled = false;
         user.blocked = true;
@@ -8571,6 +8657,7 @@ ${creatorAddr}
 
 ⏱ ${fmtTime()} UTC • Orbit`;
 
+  const retryCount = new Map(); const MAX_RETRIES = 3;
   for (let i = 0; i < toNotify.length; i++) {
     const u = toNotify[i];
     try {
@@ -8585,8 +8672,12 @@ ${creatorAddr}
       if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
       if (e.code === 429) {
-        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
-        i--; // Retry this user after rate limit delay
+        const tries = (retryCount.get(u.chatId) || 0) + 1;
+        retryCount.set(u.chatId, tries);
+        if (tries <= MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+          i--;
+        }
       } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         u.enabled = false;
         u.blocked = true;
@@ -8616,6 +8707,7 @@ async function broadcastLockAlert({ poolId, isLock, user: actor, sig, timestamp 
 ${actorAddr}
 ⏱ ${fmtTime()} UTC • Orbit`;
 
+  const retryCount = new Map(); const MAX_RETRIES = 3;
   for (let i = 0; i < toNotify.length; i++) {
     const u = toNotify[i];
     try {
@@ -8630,8 +8722,12 @@ ${actorAddr}
       if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
       if (e.code === 429) {
-        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
-        i--; // Retry this user after rate limit delay
+        const tries = (retryCount.get(u.chatId) || 0) + 1;
+        retryCount.set(u.chatId, tries);
+        if (tries <= MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+          i--;
+        }
       } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         u.enabled = false;
         u.blocked = true;
@@ -8660,6 +8756,7 @@ ${poolLine}${claimerAddr}
 
 ⏱ ${fmtTime()} UTC • Orbit`;
 
+  const retryCount = new Map(); const MAX_RETRIES = 3;
   for (let i = 0; i < toNotify.length; i++) {
     const u = toNotify[i];
     try {
@@ -8674,8 +8771,12 @@ ${poolLine}${claimerAddr}
       if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
       if (e.code === 429) {
-        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
-        i--; // Retry this user after rate limit delay
+        const tries = (retryCount.get(u.chatId) || 0) + 1;
+        retryCount.set(u.chatId, tries);
+        if (tries <= MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+          i--;
+        }
       } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         u.enabled = false;
         u.blocked = true;
@@ -8703,6 +8804,7 @@ async function broadcastClosePoolAlert({ poolId, user: actor, sig, timestamp }) 
 ${actorAddr}
 ⏱ ${fmtTime()} UTC • Orbit`;
 
+  const retryCount = new Map(); const MAX_RETRIES = 3;
   for (let i = 0; i < toNotify.length; i++) {
     const u = toNotify[i];
     try {
@@ -8717,8 +8819,12 @@ ${actorAddr}
       if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
       if (e.code === 429) {
-        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
-        i--; // Retry this user after rate limit delay
+        const tries = (retryCount.get(u.chatId) || 0) + 1;
+        retryCount.set(u.chatId, tries);
+        if (tries <= MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+          i--;
+        }
       } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         u.enabled = false;
         u.blocked = true;
@@ -8746,6 +8852,7 @@ async function broadcastProtocolFeeAlert({ poolId, user: actor, sig, timestamp }
 ${poolLine}${actorAddr}
 ⏱ ${fmtTime()} UTC • Orbit`;
 
+  const retryCount = new Map(); const MAX_RETRIES = 3;
   for (let i = 0; i < toNotify.length; i++) {
     const u = toNotify[i];
     try {
@@ -8760,8 +8867,12 @@ ${poolLine}${actorAddr}
       if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
       if (e.code === 429) {
-        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
-        i--; // Retry this user after rate limit delay
+        const tries = (retryCount.get(u.chatId) || 0) + 1;
+        retryCount.set(u.chatId, tries);
+        if (tries <= MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+          i--;
+        }
       } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         u.enabled = false;
         u.blocked = true;
@@ -8797,6 +8908,7 @@ async function broadcastAdminAlert({ poolId, user: actor, sig, timestamp, eventN
 ${poolLine}${actorAddr}
 ⏱ ${fmtTime()} UTC • Orbit`;
 
+  const retryCount = new Map(); const MAX_RETRIES = 3;
   for (let i = 0; i < toNotify.length; i++) {
     const u = toNotify[i];
     try {
@@ -8811,8 +8923,12 @@ ${poolLine}${actorAddr}
       if (i > 0 && i % 20 === 0) await new Promise(r => setTimeout(r, 100));
     } catch (e) {
       if (e.code === 429) {
-        await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
-        i--; // Retry this user after rate limit delay
+        const tries = (retryCount.get(u.chatId) || 0) + 1;
+        retryCount.set(u.chatId, tries);
+        if (tries <= MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, (e.parameters?.retry_after || 5) * 1000));
+          i--;
+        }
       } else if (e.code === 403 || e.description?.includes('blocked') || e.description?.includes('deactivated')) {
         u.enabled = false;
         u.blocked = true;
@@ -8989,16 +9105,35 @@ async function start() {
   const HEALTH_PORT = process.env.PORT || 8080;
   healthServer = http.createServer((req, res) => {
     if (req.url === '/health' || req.url === '/') {
+      const wsOrbitUp = orbitWs?.readyState === 1;
+      const wsHeliusUp = heliusWs?.readyState === 1;
+      const hasPools = pools.length > 0;
+      const priceAge = lastPriceUpdate > 0 ? Date.now() - lastPriceUpdate : Infinity;
+      const pricesOk = priceAge < CONFIG.priceRefreshInterval * 4; // ~20 min
+      let dbOk = false;
+      try { if (db) { db.prepare('SELECT 1').get(); dbOk = true; } } catch (_) {}
+
+      let status = 'ok';
+      let httpCode = 200;
+      if (!dbOk || (!wsOrbitUp && !wsHeliusUp && !hasPools)) {
+        status = 'unhealthy';
+        httpCode = 503;
+      } else if (!wsOrbitUp || !wsHeliusUp || !pricesOk) {
+        status = 'degraded';
+      }
+
       const health = {
-        status: 'ok',
+        status,
         version: '11.0.0',
         uptime: Math.floor((Date.now() - botStartTime) / 1000),
         users: users.size,
         pools: pools.length,
-        wsOrbit: orbitWs?.readyState === 1 ? 'connected' : 'disconnected',
-        wsHelius: heliusWs?.readyState === 1 ? 'connected' : 'disconnected',
+        wsOrbit: wsOrbitUp ? 'connected' : 'disconnected',
+        wsHelius: wsHeliusUp ? 'connected' : 'disconnected',
+        priceAge: priceAge === Infinity ? null : Math.floor(priceAge / 1000),
+        dbOk,
       };
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.writeHead(httpCode, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(health));
     } else {
       res.writeHead(404);
